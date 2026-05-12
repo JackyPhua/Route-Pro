@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect, useRef, useLayoutEffect } from 'react';
+import { useState, useMemo, useEffect, useRef, useLayoutEffect, useCallback } from 'react';
 import { Upload } from 'lucide-react';
 import * as XLSX from 'xlsx';
 
@@ -46,6 +46,29 @@ const selectSidebarStyle = {
   WebkitAppearance: 'none',
   MozAppearance: 'none',
   boxShadow: '0 1px 3px rgba(0,0,0,0.35)',
+  outline: 'none',
+  boxSizing: 'border-box',
+};
+
+/** 日历视图内联筛选（浅色底，与侧栏同一套状态） */
+const CAL_SELECT_CHEVRON = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2364748b' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E")`;
+const selectCalendarToolbarStyle = {
+  minWidth: '110px',
+  maxWidth: '100%',
+  padding: '6px 28px 6px 10px',
+  borderRadius: '6px',
+  border: '1px solid #cbd5e1',
+  background: '#fff',
+  color: '#1e293b',
+  fontSize: '12px',
+  fontWeight: 600,
+  cursor: 'pointer',
+  appearance: 'none',
+  WebkitAppearance: 'none',
+  MozAppearance: 'none',
+  backgroundImage: CAL_SELECT_CHEVRON,
+  backgroundRepeat: 'no-repeat',
+  backgroundPosition: 'right 8px center',
   outline: 'none',
   boxSizing: 'border-box',
 };
@@ -256,6 +279,8 @@ function CalWeekRow({
   highlightedDayNum,
   dropOnDate,
   removeScheduledVisit,
+  calendarFilterAcc,
+  calendarChipRoundFilter,
 }) {
   const rowHostRef = useRef(null);
   const [rowFontPx, setRowFontPx] = useState(CAL_CHIP_FONT_MAX);
@@ -265,14 +290,20 @@ function CalWeekRow({
       weekCells.map((slot) => {
         if (slot.kind !== 'day') return slot;
         const dateStr = `${year}-${monthIsoPad}-${String(slot.dayNum).padStart(2, '0')}`;
+        const rawTasks = (agent && schedules[agent] && schedules[agent][dateStr]) || [];
+        const filteredByCust =
+          typeof calendarFilterAcc === 'function'
+            ? rawTasks.filter((t) => calendarFilterAcc(t.acc))
+            : rawTasks;
+        const tasks = filterCalendarTasksByChipRound(filteredByCust, calendarChipRoundFilter);
         return {
           ...slot,
           dateStr,
           isSun: new Date(year, Number(monthIsoPad) - 1, slot.dayNum).getDay() === 0,
-          tasks: (agent && schedules[agent] && schedules[agent][dateStr]) || [],
+          tasks,
         };
       }),
-    [weekCells, monthIsoPad, year, agent, schedules],
+    [weekCells, monthIsoPad, year, agent, schedules, calendarFilterAcc, calendarChipRoundFilter],
   );
 
   const rowTaskCount = useMemo(
@@ -446,44 +477,130 @@ function matchesVisitScheduleFilter(scheduledTotal, filter) {
   return true;
 }
 
+/** 日历条形角标 visitRound — 筛选「只看第几次拜访」，不是客户当月总条数 */
+function filterCalendarTasksByChipRound(tasks, filter) {
+  if (filter == null || filter === 'all') return tasks;
+  if (filter === '0') return [];
+  if (filter === '6+') {
+    return tasks.filter((t) => normalizeVisitRound(t.visitRound ?? 1) >= 6);
+  }
+  const k = Number(filter);
+  if (Number.isFinite(k)) {
+    return tasks.filter((t) => normalizeVisitRound(t.visitRound ?? 1) === k);
+  }
+  return tasks;
+}
+
+/** 导入校验：非空 ACC 在表内不得重复（空格子不参与，避免因多行空 ACC 整块导入被拒） */
+function findDuplicateImportAccs(customerRows) {
+  const tally = Object.create(null);
+  for (const r of customerRows) {
+    const raw = String(r.acc ?? '').trim();
+    if (raw === '') continue;
+    tally[raw] = (tally[raw] || 0) + 1;
+  }
+  return Object.keys(tally)
+    .filter((k) => tally[k] > 1)
+    .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base', numeric: true }));
+}
+
 /** 表格导入：空白 → 显示为 —（与下拉筛选用同一套值） */
 function normalizeImportField(raw) {
   if (raw === undefined || raw === null || String(raw).trim() === '') return '—';
   return String(raw).trim();
 }
 
-/** 导入的顾客列表存为浏览器内 JSON（localStorage），每次新导入整份覆盖 */
+/** 从 localStorage 恢复的 schedules 做形状清洗 */
+function normalizePersistedSchedules(raw) {
+  if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const out = {};
+  for (const [agentKey, byDate] of Object.entries(raw)) {
+    if (!agentKey || typeof byDate !== 'object' || byDate == null || Array.isArray(byDate)) continue;
+    const dates = {};
+    for (const [dateStr, visits] of Object.entries(byDate)) {
+      if (typeof dateStr !== 'string' || !Array.isArray(visits)) continue;
+      const clean = visits
+        .filter((v) => v && v.acc != null && String(v.acc).length > 0 && v.name != null && String(v.name).length > 0)
+        .map((v) => ({
+          acc: String(v.acc),
+          name: String(v.name),
+          visitRound: normalizeVisitRound(v.visitRound ?? 1),
+        }));
+      if (clean.length > 0) dates[dateStr] = clean;
+    }
+    if (Object.keys(dates).length > 0) out[String(agentKey)] = dates;
+  }
+  return out;
+}
+
+function buildPersistPayload(customersList, sourceFileName, schedulesObj) {
+  const schedulesSafe =
+    schedulesObj && typeof schedulesObj === 'object' && !Array.isArray(schedulesObj) ? schedulesObj : {};
+  return {
+    v: 1,
+    savedAt: new Date().toISOString(),
+    importFileName: sourceFileName || '',
+    customers: customersList,
+    schedules: schedulesSafe,
+  };
+}
+
+/** 与 localStorage / Electron JSON 相同的解析 */
+function hydrateStateFromStoredObject(o) {
+  if (!o || typeof o !== 'object') return null;
+  if (Array.isArray(o)) return { customers: o, importFileName: '', schedules: {} };
+  if (Array.isArray(o.customers))
+    return {
+      customers: o.customers,
+      importFileName: typeof o.importFileName === 'string' ? o.importFileName : '',
+      schedules: normalizePersistedSchedules(o.schedules),
+    };
+  return null;
+}
+
+function hydrateStateFromStoredJson(raw) {
+  try {
+    if (raw == null || String(raw).trim() === '') return null;
+    return hydrateStateFromStoredObject(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+function hasElectronDataBridge() {
+  return typeof window !== 'undefined' && window.routePlannerElectron != null;
+}
+
+/** 导入的顾客与日历排期存为浏览器内 JSON（localStorage）；Electron 下同构写入磁盘 */
 const IMPORT_STORE_KEY = 'route-planner:v1:import-data';
 
 function loadImportStore() {
-  if (typeof localStorage === 'undefined') return { customers: [], importFileName: '' };
+  if (typeof localStorage === 'undefined') return { customers: [], importFileName: '', schedules: {} };
   try {
     const raw = localStorage.getItem(IMPORT_STORE_KEY);
-    if (!raw) return { customers: [], importFileName: '' };
-    const o = JSON.parse(raw);
-    if (Array.isArray(o)) return { customers: o, importFileName: '' };
-    if (o && Array.isArray(o.customers))
-      return { customers: o.customers, importFileName: typeof o.importFileName === 'string' ? o.importFileName : '' };
+    if (!raw) return { customers: [], importFileName: '', schedules: {} };
+    return (
+      hydrateStateFromStoredJson(raw) ?? {
+        customers: [],
+        importFileName: '',
+        schedules: {},
+      }
+    );
   } catch {
     /* ignore corrupted store */
   }
-  return { customers: [], importFileName: '' };
+  return { customers: [], importFileName: '', schedules: {} };
 }
 
-function saveImportStore(customersList, sourceFileName) {
+function saveRoutePlannerPersisted(customersList, sourceFileName, schedulesObj) {
   if (typeof localStorage === 'undefined') return;
   try {
     localStorage.setItem(
       IMPORT_STORE_KEY,
-      JSON.stringify({
-        v: 1,
-        savedAt: new Date().toISOString(),
-        importFileName: sourceFileName || '',
-        customers: customersList,
-      }),
+      JSON.stringify(buildPersistPayload(customersList, sourceFileName, schedulesObj)),
     );
   } catch (err) {
-    console.warn('route-planner: persist import JSON failed', err);
+    console.warn('route-planner: persist route planner failed', err);
     window.alert('Could not save to browser storage (quota full or private mode).');
   }
 }
@@ -498,29 +615,147 @@ const sidebarSectionLabel = {
   marginBottom: '3px',
 };
 
+/** 侧栏一行一物：同名 ACC（不同店）在 React / 勾选里不能只靠 acc（会并成一笔） */
+function sidebarRowStemKey(row) {
+  return [
+    String(row.acc ?? ''),
+    String(row.name ?? ''),
+    String(row.area ?? ''),
+    String(row.channel ?? ''),
+    String(row.category ?? ''),
+  ].join('\u001f');
+}
+
+function sidebarRowListKey(row, listIndex) {
+  return `${sidebarRowStemKey(row)}\u001f${listIndex}`;
+}
+
 function App() {
-  const [customers, setCustomers] = useState(() => loadImportStore().customers);
+  const persistedOnMount = useMemo(() => {
+    if (hasElectronDataBridge()) {
+      return { customers: [], importFileName: '', schedules: {} };
+    }
+    return loadImportStore();
+  }, []);
+  const [customers, setCustomers] = useState(persistedOnMount.customers);
   const [agent, setAgent] = useState('');
   const [area, setArea] = useState('');
-  const [schedules, setSchedules] = useState({});
+  const [schedules, setSchedules] = useState(persistedOnMount.schedules);
   const [year, setYear] = useState(2026);
   /** 0-indexed month (aligned with Date — 4 = May) */
   const [month, setMonth] = useState(4);
   /** Highlights a calendar cell (1 … days in month); only used in Calendar view */
   const [focusedDay, setFocusedDay] = useState(null);
   const [viewMode, setViewMode] = useState('calendar');
-  const [importFileName, setImportFileName] = useState(() => loadImportStore().importFileName);
-  const [visitCountFilter, setVisitCountFilter] = useState('all');
+  const [importFileName, setImportFileName] = useState(persistedOnMount.importFileName);
+  const [sidebarVisitCountFilter, setSidebarVisitCountFilter] = useState('all');
+  /** 日历条形「#1/#2/#3」筛选；与侧栏「当月拜访总次数」不同 */
+  const [calendarChipRoundFilter, setCalendarChipRoundFilter] = useState('all');
   /** 侧栏 Channel / Category（与表格列 CHANNEL、CATEGORY 对应；空档为 —） */
   const [channelFilter, setChannelFilter] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('');
   /** 侧栏店名 / 账号即时过滤（不区分大小写） */
   const [sidebarNameQuery, setSidebarNameQuery] = useState('');
-  /** 侧栏多选：勾选后从任一已选行拖到日历可一次排入多天客户 */
-  const [sidebarSelectedAccs, setSidebarSelectedAccs] = useState(() => new Set());
+  /** 侧栏多选：每行单独 key（同 ACC 可并存） */
+  const [sidebarSelectedRowKeys, setSidebarSelectedRowKeys] = useState(() => new Set());
   /** Summary / print: day-of-month range within the selected Year–Month */
   const [summaryDayFrom, setSummaryDayFrom] = useState(1);
   const [summaryDayTo, setSummaryDayTo] = useState(31);
+
+  const electronHydrationDoneRef = useRef(!hasElectronDataBridge());
+  const persistDebouncedTimerRef = useRef(null);
+  const lastPersistJsonRef = useRef('');
+
+  useEffect(() => {
+    const api = window.routePlannerElectron;
+    if (!api?.load) return;
+    let cancelled = false;
+    api
+      .load()
+      .then((raw) => {
+        if (cancelled) return;
+        const h = hydrateStateFromStoredJson(raw);
+        if (h) {
+          setCustomers(h.customers);
+          setSchedules(h.schedules);
+          setImportFileName(h.importFileName);
+        }
+      })
+      .catch((err) => {
+        console.warn('route-planner: electron datastore load failed', err);
+      })
+      .finally(() => {
+        if (!cancelled) electronHydrationDoneRef.current = true;
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    lastPersistJsonRef.current = JSON.stringify(
+      buildPersistPayload(customers, importFileName, schedules),
+    );
+  }, [customers, importFileName, schedules]);
+
+  useEffect(() => {
+    const flushSyncDisk = window.routePlannerElectron?.saveSync;
+    if (!flushSyncDisk) return;
+    const onHide = () => {
+      clearTimeout(persistDebouncedTimerRef.current);
+      try {
+        flushSyncDisk(lastPersistJsonRef.current);
+      } catch {
+        /* ignore */
+      }
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') onHide();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('beforeunload', onHide);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('beforeunload', onHide);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!electronHydrationDoneRef.current) return;
+    const sched =
+      schedules && typeof schedules === 'object' && !Array.isArray(schedules) ? schedules : {};
+    const json = JSON.stringify(buildPersistPayload(customers, importFileName, sched));
+
+    if (window.routePlannerElectron?.save) {
+      clearTimeout(persistDebouncedTimerRef.current);
+      persistDebouncedTimerRef.current = setTimeout(() => {
+        window.routePlannerElectron.save(json).catch(() => {
+          window.alert('Could not save Route Planner data file.');
+        });
+      }, 380);
+      return () => clearTimeout(persistDebouncedTimerRef.current);
+    }
+
+    saveRoutePlannerPersisted(customers, importFileName, sched);
+    return undefined;
+  }, [customers, importFileName, schedules]);
+
+  const salesAgentOptions = useMemo(() => {
+    const s = new Set();
+    for (const c of customers) {
+      const a = String(c.agent ?? '').trim();
+      if (a !== '') s.add(a);
+    }
+    for (const key of Object.keys(schedules ?? {})) {
+      const k = String(key).trim();
+      if (k !== '') s.add(k);
+    }
+    return [...s].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base', numeric: true }));
+  }, [customers, schedules]);
+
+  useEffect(() => {
+    setAgent((cur) => (!cur ? cur : salesAgentOptions.includes(cur) ? cur : ''));
+  }, [salesAgentOptions]);
 
   const filteredAreas = useMemo(() => {
     if (!agent) return [];
@@ -552,15 +787,32 @@ function App() {
     return [...set].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base', numeric: true }));
   }, [agent, area, channelFilter, customers]);
 
-  const visitCounts = useMemo(() => {
+  const visitCountsTotal = useMemo(() => {
     const counts = {};
     if (agent && schedules[agent]) {
       Object.values(schedules[agent]).forEach((dayList) => {
-        dayList.forEach((c) => { counts[c.acc] = (counts[c.acc] || 0) + 1; });
+        dayList.forEach((c) => {
+          counts[c.acc] = (counts[c.acc] || 0) + 1;
+        });
       });
     }
     return counts;
   }, [agent, schedules]);
+
+  /** 仅当前工具栏所选年月的排期次数 — Visits 筛选与日历格子一致 */
+  const visitCountsMonth = useMemo(() => {
+    const counts = {};
+    if (agent && schedules[agent]) {
+      const prefix = `${year}-${String(month + 1).padStart(2, '0')}-`;
+      for (const [d, dayList] of Object.entries(schedules[agent])) {
+        if (!d.startsWith(prefix)) continue;
+        dayList.forEach((c) => {
+          counts[c.acc] = (counts[c.acc] || 0) + 1;
+        });
+      }
+    }
+    return counts;
+  }, [agent, schedules, year, month]);
 
   const sidebarBaseCustomers = useMemo(() => {
     if (!agent) return [];
@@ -574,8 +826,11 @@ function App() {
   }, [agent, area, channelFilter, categoryFilter, customers]);
 
   const sidebarListedCustomers = useMemo(
-    () => sidebarBaseCustomers.filter((c) => matchesVisitScheduleFilter(visitCounts[c.acc], visitCountFilter)),
-    [sidebarBaseCustomers, visitCounts, visitCountFilter],
+    () =>
+      sidebarBaseCustomers.filter((c) =>
+        matchesVisitScheduleFilter(visitCountsMonth[c.acc], sidebarVisitCountFilter),
+      ),
+    [sidebarBaseCustomers, visitCountsMonth, sidebarVisitCountFilter],
   );
 
   const sidebarDisplayedCustomers = useMemo(() => {
@@ -606,7 +861,7 @@ function App() {
   }, [sidebarListedCustomers, sidebarNameQuery]);
 
   useEffect(() => {
-    setSidebarSelectedAccs(new Set());
+    setSidebarSelectedRowKeys(new Set());
     setSidebarNameQuery('');
     setChannelFilter('');
     setCategoryFilter('');
@@ -627,11 +882,15 @@ function App() {
     if (!el) return;
     const all =
       sidebarDisplayedCustomers.length > 0 &&
-      sidebarDisplayedCustomers.every((c) => sidebarSelectedAccs.has(c.acc));
-    const some = sidebarDisplayedCustomers.some((c) => sidebarSelectedAccs.has(c.acc));
+      sidebarDisplayedCustomers.every((row, idx) =>
+        sidebarSelectedRowKeys.has(sidebarRowListKey(row, idx)),
+      );
+    const some = sidebarDisplayedCustomers.some((row, idx) =>
+      sidebarSelectedRowKeys.has(sidebarRowListKey(row, idx)),
+    );
     el.checked = all;
     el.indeterminate = some && !all;
-  }, [sidebarDisplayedCustomers, sidebarSelectedAccs]);
+  }, [sidebarDisplayedCustomers, sidebarSelectedRowKeys]);
 
   /** 侧栏：已排总数 → 调色桶（≥6 与第 6 色相同）；角标显示真实总数 */
   const sidebarColorBucket = (total) => {
@@ -672,6 +931,31 @@ function App() {
     customers.forEach((c) => { map[c.acc] = c; });
     return map;
   }, [customers]);
+
+  /** 日历格内拜访条：Area / Channel / Category / Find 与侧栏共用；条形序号用 calendarChipRoundFilter */
+  const calendarFilterAcc = useCallback(
+    (acc) => {
+      const c = customerByAcc[acc];
+      if (!c) return true;
+      if (area && c.area !== area) return false;
+      if (channelFilter && String(c.channel ?? '—') !== channelFilter) return false;
+      if (categoryFilter && String(c.category ?? '—') !== categoryFilter) return false;
+      const raw = sidebarNameQuery.trim().toLowerCase();
+      if (raw) {
+        const nm = String(c.name ?? '').toLowerCase();
+        const ac = String(acc ?? '').toLowerCase();
+        if (!nm.includes(raw) && !ac.includes(raw)) return false;
+      }
+      return true;
+    },
+    [
+      customerByAcc,
+      area,
+      channelFilter,
+      categoryFilter,
+      sidebarNameQuery,
+    ],
+  );
 
   const summarySections = useMemo(() => {
     if (!agent) return null;
@@ -857,8 +1141,10 @@ function App() {
   const handleFile = (e) => {
     const input = e.target;
     const file = input?.files?.[0];
-    setImportFileName(file?.name ?? '');
-    if (!file) return;
+    if (!file) {
+      setImportFileName('');
+      return;
+    }
 
     const ext = (file.name.split('.').pop() ?? '').toLowerCase();
     const isCsv = ext === 'csv';
@@ -876,8 +1162,23 @@ function App() {
         }
         const rows = parseWorkbookFirstSheet(workbook);
         const mapped = mapImportedRowsToCustomers(rows);
+        const dupAccs = findDuplicateImportAccs(mapped);
+        if (dupAccs.length > 0) {
+          const sample = dupAccs.slice(0, 12).join(', ');
+          const more = dupAccs.length > 12 ? `\n… and ${dupAccs.length - 12} more.` : '';
+          window.alert(
+            `Import cancelled: each ACC (account number) must be unique in the spreadsheet.\n\nDuplicate ACC values (${dupAccs.length}): ${sample}${more}\n\nFix the file and import again.`,
+          );
+          if (input && typeof input.value === 'string') input.value = '';
+          return;
+        }
         setCustomers(mapped);
-        saveImportStore(mapped, file.name ?? '');
+        setImportFileName(file.name ?? '');
+        setSchedules({});
+        /** 新来的客多为 0 次拜访；沿用「Exactly N visits」会像被吃掉一样 */
+        setSidebarVisitCountFilter('all');
+        setCalendarChipRoundFilter('all');
+        setSidebarNameQuery('');
         if (input && typeof input.value === 'string') input.value = '';
       } catch (err) {
         console.error(err);
@@ -890,6 +1191,38 @@ function App() {
 
     if (isCsv) reader.readAsText(file, 'UTF-8');
     else reader.readAsArrayBuffer(file);
+  };
+
+  const clearStoredImportData = () => {
+    if (
+      !window.confirm(
+        hasElectronDataBridge()
+          ? 'Remove all saved customers and calendar visits from this machine (data file and browser cache)?'
+          : 'Remove saved customers, import file name, and calendar visits from this browser?',
+      )
+    ) {
+      return;
+    }
+    try {
+      if (typeof localStorage !== 'undefined') localStorage.removeItem(IMPORT_STORE_KEY);
+    } catch {
+      window.alert('Could not access browser storage.');
+      return;
+    }
+    setCustomers([]);
+    setImportFileName('');
+    setSchedules({});
+    setAgent('');
+    setArea('');
+    setSidebarVisitCountFilter('all');
+    setCalendarChipRoundFilter('all');
+    setChannelFilter('');
+    setCategoryFilter('');
+    setSidebarNameQuery('');
+    setSidebarSelectedRowKeys(new Set());
+    setFocusedDay(null);
+    const inp = document.getElementById('route-data-import');
+    if (inp && typeof inp.value === 'string') inp.value = '';
   };
 
   const onDrop = (dateStr, rawData) => {
@@ -975,7 +1308,7 @@ function App() {
       return { ...prev, [agent]: agentSched };
     });
 
-    if (!isCalendarMove) setSidebarSelectedAccs(new Set());
+    if (!isCalendarMove) setSidebarSelectedRowKeys(new Set());
   };
 
   const removeScheduledVisit = (dateStr, acc) => {
@@ -1014,6 +1347,8 @@ function App() {
             highlightedDayNum={highlightedDay}
             dropOnDate={(dateStr, raw) => onDrop(dateStr, raw)}
             removeScheduledVisit={removeScheduledVisit}
+            calendarFilterAcc={calendarFilterAcc}
+            calendarChipRoundFilter={calendarChipRoundFilter}
           />
         ))}
       </div>
@@ -1247,10 +1582,25 @@ function App() {
           >
             {importFileName ? importFileName : 'No file chosen · .xlsx / .xls / .csv'}
           </div>
-          <div style={{ marginTop: '4px', fontSize: '8px', opacity: 0.55, lineHeight: 1.35, color: 'rgba(148, 163, 184, 0.95)' }}>
-            Imported customers persist in this browser as JSON (localStorage); each new import replaces the previous save.
-            Optional columns for sidebar filters: CHANNEL, CATEGORY (or PRODUCT CATEGORY).
-          </div>
+          <button
+            type="button"
+            className="no-print"
+            onClick={clearStoredImportData}
+            style={{
+              marginTop: '8px',
+              width: '100%',
+              padding: '6px 8px',
+              borderRadius: '6px',
+              border: '1px solid rgba(248, 113, 113, 0.4)',
+              background: 'rgba(127, 29, 29, 0.38)',
+              color: '#fecaca',
+              fontSize: '9px',
+              fontWeight: 600,
+              cursor: 'pointer',
+            }}
+          >
+            Clear saved import (this browser)
+          </button>
         </div>
 
         <div style={{ marginBottom: '8px' }}>
@@ -1259,11 +1609,20 @@ function App() {
             id="sidebar-agent"
             className="sidebar-select"
             value={agent}
-            onChange={(e) => { setAgent(e.target.value); setArea(''); setVisitCountFilter('all'); }}
+            onChange={(e) => {
+              setAgent(e.target.value);
+              setArea('');
+              setSidebarVisitCountFilter('all');
+              setCalendarChipRoundFilter('all');
+            }}
             style={{ ...selectSidebarStyle, marginBottom: 0 }}
           >
             <option value="">— Select agent —</option>
-            {[...new Set(customers.map(c => c.agent))].map(a => <option key={a} value={a}>{a}</option>)}
+            {salesAgentOptions.map((a) => (
+              <option key={a} value={a}>
+                {a}
+              </option>
+            ))}
           </select>
         </div>
 
@@ -1283,12 +1642,16 @@ function App() {
             </select>
           </div>
           <div style={{ flex: '1 1 50%', minWidth: 0, display: 'flex', flexDirection: 'column' }}>
-            <label style={sidebarSectionLabel} htmlFor="sidebar-visit-filter">4. Visits</label>
+            <label style={sidebarSectionLabel} htmlFor="sidebar-visit-filter">
+              4. Visits{' '}
+              <span style={{ fontWeight: 600, opacity: 0.85, textTransform: 'none', letterSpacing: 'normal' }}>(sidebar)</span>
+            </label>
             <select
               id="sidebar-visit-filter"
               className="sidebar-select"
-              value={visitCountFilter}
-              onChange={(e) => setVisitCountFilter(e.target.value)}
+              value={sidebarVisitCountFilter}
+              onChange={(e) => setSidebarVisitCountFilter(e.target.value)}
+              title={`Sidebar list only · counts use calendar month ${monthLabel}.`}
               style={{ ...selectSidebarStyle, marginBottom: 0 }}
               disabled={!agent}
             >
@@ -1434,12 +1797,13 @@ function App() {
                     aria-label="Select all customers in list"
                     onMouseDown={(e) => e.stopPropagation()}
                     onChange={() => {
-                      setSidebarSelectedAccs((prev) => {
+                      setSidebarSelectedRowKeys((prev) => {
                         const visible = sidebarDisplayedCustomers;
                         const allOn =
-                          visible.length > 0 && visible.every((row) => prev.has(row.acc));
+                          visible.length > 0 &&
+                          visible.every((row, i) => prev.has(sidebarRowListKey(row, i)));
                         if (allOn) return new Set();
-                        return new Set(visible.map((row) => row.acc));
+                        return new Set(visible.map((row, i) => sidebarRowListKey(row, i)));
                       });
                     }}
                     style={{ width: '11px', height: '11px', cursor: 'pointer', accentColor: '#38bdf8' }}
@@ -1450,38 +1814,41 @@ function App() {
                   type="button"
                   className="no-print"
                   onMouseDown={(e) => e.stopPropagation()}
-                  onClick={() => setSidebarSelectedAccs(new Set())}
-                  disabled={sidebarSelectedAccs.size === 0}
+                  onClick={() => setSidebarSelectedRowKeys(new Set())}
+                  disabled={sidebarSelectedRowKeys.size === 0}
                   style={{
                     fontSize: '8px',
                     fontWeight: 600,
                     padding: '2px 7px',
                     borderRadius: '5px',
                     border: '1px solid rgba(148, 163, 184, 0.35)',
-                    background: sidebarSelectedAccs.size === 0 ? 'rgba(51, 65, 85, 0.5)' : 'rgba(51, 65, 85, 0.95)',
-                    color: sidebarSelectedAccs.size === 0 ? 'rgba(148, 163, 184, 0.5)' : '#e2e8f0',
-                    cursor: sidebarSelectedAccs.size === 0 ? 'not-allowed' : 'pointer',
+                    background: sidebarSelectedRowKeys.size === 0 ? 'rgba(51, 65, 85, 0.5)' : 'rgba(51, 65, 85, 0.95)',
+                    color: sidebarSelectedRowKeys.size === 0 ? 'rgba(148, 163, 184, 0.5)' : '#e2e8f0',
+                    cursor: sidebarSelectedRowKeys.size === 0 ? 'not-allowed' : 'pointer',
                   }}
                 >
                   Clear selection
                 </button>
-                {sidebarSelectedAccs.size > 0 && (
+                {sidebarSelectedRowKeys.size > 0 && (
                   <span style={{ fontSize: '8px', color: 'rgba(148, 163, 184, 0.95)', marginLeft: 'auto' }}>
-                    {sidebarSelectedAccs.size} selected — drag one checked row; selection clears after drop
+                    {sidebarSelectedRowKeys.size} selected — drag one checked row; selection clears after drop
                   </span>
                 )}
               </div>
-              {sidebarDisplayedCustomers.map((c) => {
-                const total = visitCounts[c.acc] ?? 0;
+              {sidebarDisplayedCustomers.map((c, idx) => {
+                const rk = sidebarRowListKey(c, idx);
+                const total = visitCountsTotal[c.acc] ?? 0;
                 const bucket = sidebarColorBucket(total);
                 const pal = paletteForTotalVisits(total);
                 const badge = total > 0 ? String(total) : null;
-                const isSelected = sidebarSelectedAccs.has(c.acc);
-                const bulkOnList = sidebarDisplayedCustomers.filter((row) => sidebarSelectedAccs.has(row.acc));
+                const isSelected = sidebarSelectedRowKeys.has(rk);
+                const bulkOnList = sidebarDisplayedCustomers.filter((row, i) =>
+                  sidebarSelectedRowKeys.has(sidebarRowListKey(row, i)),
+                );
                 const useBulk = isSelected && bulkOnList.length >= 2;
                 return (
                   <div
-                    key={c.acc}
+                    key={rk}
                     draggable
                     onDragStart={(e) => {
                       const payload = useBulk
@@ -1499,9 +1866,9 @@ function App() {
                       position: 'relative',
                       display: 'flex',
                       alignItems: 'stretch',
-                      gap: '0',
+                      gap: '4px',
                       background: pal.sidebarBg,
-                      padding: '6px 30px 6px 4px',
+                      padding: '6px 6px 6px 8px',
                       borderRadius: '5px',
                       marginBottom: '6px',
                       borderLeft: `4px solid ${isSelected ? '#38bdf8' : pal.sidebarBorder}`,
@@ -1514,39 +1881,21 @@ function App() {
                         .join(', ') || undefined,
                     }}
                   >
-                    <label
+                    <div
                       style={{
-                        display: 'flex',
-                        alignItems: 'flex-start',
-                        padding: '2px 4px 0 2px',
-                        cursor: 'pointer',
                         flexShrink: 0,
+                        width: '22px',
+                        minWidth: '22px',
+                        display: 'flex',
+                        justifyContent: 'center',
+                        alignItems: 'flex-start',
+                        paddingTop: '2px',
                       }}
-                      onMouseDown={(e) => e.stopPropagation()}
                     >
-                      <input
-                        type="checkbox"
-                        checked={isSelected}
-                        aria-label={`Select ${c.name}`}
-                        onChange={() => {
-                          setSidebarSelectedAccs((prev) => {
-                            const next = new Set(prev);
-                            if (next.has(c.acc)) next.delete(c.acc);
-                            else next.add(c.acc);
-                            return next;
-                          });
-                        }}
-                        style={{ width: '13px', height: '13px', marginTop: '2px', cursor: 'pointer', accentColor: '#38bdf8' }}
-                      />
-                    </label>
-                    <div style={{ flex: 1, minWidth: 0, paddingLeft: '4px' }}>
                       {badge != null && (
                         <span
                           title={total >= 6 ? `已排 ${total} 次（颜色与第 6 档相同）` : `已排 ${total} 次`}
                           style={{
-                            position: 'absolute',
-                            top: '5px',
-                            right: '5px',
                             minWidth: '18px',
                             height: '18px',
                             padding: '0 4px',
@@ -1564,9 +1913,36 @@ function App() {
                           {badge}
                         </span>
                       )}
+                    </div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: '8px', color: bucket > 0 ? 'rgba(248, 250, 252, 0.85)' : '#60a5fa' }}>{c.acc}{total > 0 ? ` · ${total}×` : ''}</div>
                       <div style={{ fontSize: '10px', fontWeight: 700, color: '#f8fafc', lineHeight: 1.22 }}>{c.name}</div>
                     </div>
+                    <label
+                      style={{
+                        display: 'flex',
+                        alignItems: 'flex-start',
+                        padding: '2px 0 0 2px',
+                        cursor: 'pointer',
+                        flexShrink: 0,
+                      }}
+                      onMouseDown={(e) => e.stopPropagation()}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={isSelected}
+                        aria-label={`Select ${c.name}`}
+                        onChange={() => {
+                          setSidebarSelectedRowKeys((prev) => {
+                            const next = new Set(prev);
+                            if (next.has(rk)) next.delete(rk);
+                            else next.add(rk);
+                            return next;
+                          });
+                        }}
+                        style={{ width: '13px', height: '13px', marginTop: '2px', cursor: 'pointer', accentColor: '#38bdf8' }}
+                      />
+                    </label>
                   </div>
                 );
               })}
@@ -1683,7 +2059,146 @@ function App() {
               WebkitOverflowScrolling: 'touch',
             }}
           >
-            {viewMode === 'calendar' ? renderCalendar() : renderSummary()}
+            {viewMode === 'calendar' ? (
+              <>
+                <div
+                  className="no-print cal-calendar-filters"
+                  style={{
+                    flexShrink: 0,
+                    padding: '8px 12px',
+                    borderBottom: '1px solid #e2e8f0',
+                    background: '#f8fafc',
+                    width: '100%',
+                    boxSizing: 'border-box',
+                  }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      flexWrap: 'wrap',
+                      gap: '10px 12px',
+                      alignItems: 'flex-end',
+                    }}
+                  >
+                    <label style={{ display: 'flex', flexDirection: 'column', gap: '4px', minWidth: '0', flex: '1 1 120px' }}>
+                      <span style={{ fontSize: '10px', fontWeight: 700, color: '#64748b', textTransform: 'uppercase' }}>Sales agent</span>
+                      <select
+                        aria-label="Sales agent"
+                        value={agent}
+                        onChange={(e) => {
+              setAgent(e.target.value);
+              setArea('');
+              setSidebarVisitCountFilter('all');
+              setCalendarChipRoundFilter('all');
+            }}
+                        style={{ ...selectCalendarToolbarStyle, width: '100%' }}
+                      >
+                        <option value="">— Select —</option>
+                        {salesAgentOptions.map((a) => (
+                          <option key={a} value={a}>
+                            {a}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label style={{ display: 'flex', flexDirection: 'column', gap: '4px', minWidth: '0', flex: '1 1 110px' }}>
+                      <span style={{ fontSize: '10px', fontWeight: 700, color: '#64748b', textTransform: 'uppercase' }}>Area</span>
+                      <select
+                        aria-label="Area filter"
+                        value={area}
+                        onChange={(e) => setArea(e.target.value)}
+                        style={{ ...selectCalendarToolbarStyle, width: '100%' }}
+                        disabled={!agent}
+                      >
+                        <option value="">{agent ? '— All areas —' : '— Agent first —'}</option>
+                        {filteredAreas.map((a) => (
+                          <option key={a} value={a}>{a}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label style={{ display: 'flex', flexDirection: 'column', gap: '4px', minWidth: '0', flex: '1 1 120px' }}>
+                      <span style={{ fontSize: '10px', fontWeight: 700, color: '#64748b', textTransform: 'uppercase' }}>Visits</span>
+                      <select
+                        aria-label="Filter calendar visits by number on bar"
+                        value={calendarChipRoundFilter}
+                        onChange={(e) => setCalendarChipRoundFilter(e.target.value)}
+                        title={`Show only bars whose left badge matches (independent from sidebar “total visits”). “All visits” shows every bar.`}
+                        style={{ ...selectCalendarToolbarStyle, width: '100%' }}
+                        disabled={!agent}
+                      >
+                        <option value="all">{agent ? '— All visits —' : '— Agent first —'}</option>
+                        <option value="0">Hide all chips</option>
+                        <option value="1">1 visit</option>
+                        <option value="2">2 visit</option>
+                        <option value="3">3 visit</option>
+                        <option value="4">4 visit</option>
+                        <option value="5">5 visit</option>
+                        <option value="6+">6+ visit</option>
+                      </select>
+                    </label>
+                    <label style={{ display: 'flex', flexDirection: 'column', gap: '4px', minWidth: '0', flex: '1 1 110px' }}>
+                      <span style={{ fontSize: '10px', fontWeight: 700, color: '#64748b', textTransform: 'uppercase' }}>Channel</span>
+                      <select
+                        aria-label="Channel filter"
+                        value={channelFilter}
+                        onChange={(e) => setChannelFilter(e.target.value)}
+                        style={{ ...selectCalendarToolbarStyle, width: '100%' }}
+                        disabled={!agent}
+                      >
+                        <option value="">{agent ? '— All channels —' : '— Agent first —'}</option>
+                        {sidebarChannelOptions.map((ch) => (
+                          <option key={ch} value={ch}>{ch}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label style={{ display: 'flex', flexDirection: 'column', gap: '4px', minWidth: '0', flex: '1 1 110px' }}>
+                      <span style={{ fontSize: '10px', fontWeight: 700, color: '#64748b', textTransform: 'uppercase' }}>Category</span>
+                      <select
+                        aria-label="Category filter"
+                        value={categoryFilter}
+                        onChange={(e) => setCategoryFilter(e.target.value)}
+                        style={{ ...selectCalendarToolbarStyle, width: '100%' }}
+                        disabled={!agent}
+                      >
+                        <option value="">{agent ? '— All categories —' : '— Agent first —'}</option>
+                        {sidebarCategoryOptions.map((cat) => (
+                          <option key={cat} value={cat}>{cat}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label style={{ display: 'flex', flexDirection: 'column', gap: '4px', minWidth: '0', flex: '1 1 200px' }}>
+                      <span style={{ fontSize: '10px', fontWeight: 700, color: '#64748b', textTransform: 'uppercase' }}>Find</span>
+                      <input
+                        type="search"
+                        aria-label="Filter calendar chips by customer name or account"
+                        value={sidebarNameQuery}
+                        onChange={(e) => setSidebarNameQuery(e.target.value)}
+                        placeholder={agent ? 'Name or account…' : 'Agent first'}
+                        disabled={!agent}
+                        autoCapitalize="off"
+                        spellCheck={false}
+                        style={{
+                          width: '100%',
+                          padding: '6px 10px',
+                          borderRadius: '6px',
+                          border: `1px solid ${agent ? '#cbd5e1' : '#e2e8f0'}`,
+                          background: agent ? '#fff' : '#f1f5f9',
+                          color: '#1e293b',
+                          fontSize: '12px',
+                          fontWeight: 500,
+                          outline: 'none',
+                          boxSizing: 'border-box',
+                          opacity: agent ? 1 : 0.7,
+                        }}
+                      />
+                    </label>
+                  </div>
+                </div>
+                {renderCalendar()}
+              </>
+            ) : (
+              renderSummary()
+            )}
           </div>
         </div>
       </main>

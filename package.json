@@ -1,7 +1,9 @@
 {
   "name": "route-planner",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
+  "description": "Sales route planner — import customers, drag visits onto the calendar.",
+  "author": "JackyPhua",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
@@ -9,7 +11,9 @@
     "build": "vite build",
     "build:electron": "vite build --mode electron",
     "electron:run": "npm run build:electron && electron .",
-    "electron:dist": "npm run build:electron && electron-builder --win",
+    "electron:dist": "npm run build:electron && electron-builder --win portable",
+    "electron:dist:setup": "npm run build:electron && electron-builder --win nsis",
+    "electron:dist:all": "npm run build:electron && electron-builder --win portable nsis",
     "lint": "eslint .",
     "preview": "vite preview"
   },
@@ -36,6 +40,7 @@
   "build": {
     "appId": "com.routeplanner.app",
     "productName": "Route Planner",
+    "icon": "build/icon.png",
     "directories": {
       "output": "release"
     },
@@ -48,21 +53,21 @@
       "target": [
         {
           "target": "portable",
-          "arch": [
-            "x64"
-          ]
+          "arch": ["x64"]
         },
         {
           "target": "nsis",
-          "arch": [
-            "x64"
-          ]
+          "arch": ["x64"]
         }
       ]
     },
     "nsis": {
       "oneClick": false,
-      "allowToChangeInstallationDirectory": true
+      "allowToChangeInstallationDirectory": true,
+      "allowElevation": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Route Planner"
     }
   }
 }
