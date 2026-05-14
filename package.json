@@ -1,7 +1,7 @@
 {
   "name": "route-planner",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Sales route planner — import customers, drag visits onto the calendar.",
   "author": "JackyPhua",
   "type": "module",

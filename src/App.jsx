@@ -510,6 +510,97 @@ function normalizeImportField(raw) {
   return String(raw).trim();
 }
 
+/** 欄標題比對用（中英混排、空格差異） */
+function headerKeyNormalized(k) {
+  return String(k ?? '')
+    .normalize('NFKC')
+    .replace(/\u00a0|\u3000/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toUpperCase();
+}
+
+/**
+ * sheet_to_json 欄キー入面認「店名 / 客户名」，唔好用單一 substring 「NAME」，否則會先撞上 SALES AGENT NAME 等標題，
+ * kkk、xxx 之流會存入錯欄位而搜唔到。
+ */
+function pickDebtorNameColumnKey(keys) {
+  if (!keys?.length) return null;
+  const list = keys.filter((k) => k != null && String(k).trim() !== '');
+  const nk = headerKeyNormalized;
+  /** 常見全称 */
+  for (const needle of ['DEBTOR NAME', 'CUSTOMER NAME', 'COMPANY NAME', 'SHIP TO NAME', 'BILL TO NAME', 'CUS NAME']) {
+    const hit = list.find((k) => nk(k) === nk(needle));
+    if (hit) return hit;
+  }
+  for (const needle of ['DEBTOR NAME', 'CUSTOMER NAME', 'COMPANY NAME', 'SHIP TO NAME', 'CUS NAME']) {
+    const hit = list.find((k) => nk(k).includes(needle.replace(/\s+/g, ' ')));
+    if (hit) return hit;
+  }
+  const exactNameOnly = list.find((k) => nk(k) === 'NAME');
+  if (exactNameOnly) return exactNameOnly;
+  return list.find((k) => {
+    const u = nk(k);
+    if (!/\bNAME\b/.test(u)) return false;
+    if (/SALES\s*AGENT|AGENT\s*NAME|NAME\s*\(\s*sales|NAME\s*\(\s*s\.?\s*a|NAME\s*OF\s*AGENTS?|SALES\s+(MAN|REP|NAME)|SALESMAN/i.test(u)) return false;
+    return true;
+  });
+}
+
+/** 搜尋欄匹配：統一標點空格、唔吃 Excel 嘅零寬字 */
+function normalizeSidebarSearchPiece(s) {
+  return String(s ?? '')
+    .normalize('NFKC')
+    .replace(/\u00a0|\u3000/g, ' ')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * 重新导入客户表后合并旧排期：账号仍在新表中则保留拜访（日期、# 不变），姓名随新表更新；
+ * 业务员以新表为准（账号若改派，拜访会跟到新业务员下）。新表中不存在的账号之拜访会丢弃。
+ */
+function mergeSchedulesAfterCustomerReimport(prevSchedules, newCustomers) {
+  const byAcc = Object.fromEntries(
+    newCustomers.map((c) => [String(c.acc ?? ''), c]),
+  );
+  let droppedVisits = 0;
+  const prev =
+    prevSchedules && typeof prevSchedules === 'object' && !Array.isArray(prevSchedules)
+      ? prevSchedules
+      : {};
+
+  const next = {};
+
+  for (const byDate of Object.values(prev)) {
+    if (!byDate || typeof byDate !== 'object') continue;
+    for (const [dateStr, visits] of Object.entries(byDate)) {
+      if (typeof dateStr !== 'string' || !Array.isArray(visits)) continue;
+      for (const v of visits) {
+        if (!v || v.acc == null || String(v.acc).length === 0) continue;
+        const acc = String(v.acc);
+        const c = byAcc[acc];
+        if (!c) {
+          droppedVisits += 1;
+          continue;
+        }
+        const agent = String(c.agent ?? 'UNASSIGNED').trim() || 'UNASSIGNED';
+        if (!next[agent]) next[agent] = {};
+        if (!next[agent][dateStr]) next[agent][dateStr] = [];
+        next[agent][dateStr].push({
+          acc,
+          name: String(c.name ?? v.name ?? ''),
+          visitRound: normalizeVisitRound(v.visitRound ?? 1),
+        });
+      }
+    }
+  }
+
+  return { schedules: normalizePersistedSchedules(next), droppedVisits };
+}
+
 /** 从 localStorage 恢复的 schedules 做形状清洗 */
 function normalizePersistedSchedules(raw) {
   if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return {};
@@ -639,7 +730,14 @@ function App() {
   }, []);
   const [customers, setCustomers] = useState(persistedOnMount.customers);
   const [agent, setAgent] = useState('');
-  const [area, setArea] = useState('');
+  /** 侧栏名单筛选（与日历互不干扰） */
+  const [sidebarArea, setSidebarArea] = useState('');
+  const [sidebarChannelFilter, setSidebarChannelFilter] = useState('');
+  const [sidebarCategoryFilter, setSidebarCategoryFilter] = useState('');
+  /** 日历格子内拜访条筛选 */
+  const [calendarArea, setCalendarArea] = useState('');
+  const [calendarChannelFilter, setCalendarChannelFilter] = useState('');
+  const [calendarCategoryFilter, setCalendarCategoryFilter] = useState('');
   const [schedules, setSchedules] = useState(persistedOnMount.schedules);
   const [year, setYear] = useState(2026);
   /** 0-indexed month (aligned with Date — 4 = May) */
@@ -651,13 +749,14 @@ function App() {
   const [sidebarVisitCountFilter, setSidebarVisitCountFilter] = useState('all');
   /** 日历条形「#1/#2/#3」筛选；与侧栏「当月拜访总次数」不同 */
   const [calendarChipRoundFilter, setCalendarChipRoundFilter] = useState('all');
-  /** 侧栏 Channel / Category（与表格列 CHANNEL、CATEGORY 对应；空档为 —） */
-  const [channelFilter, setChannelFilter] = useState('');
-  const [categoryFilter, setCategoryFilter] = useState('');
-  /** 侧栏店名 / 账号即时过滤（不区分大小写） */
+  /** 侧栏店名 / 账号即时过滤（仅影响侧栏列表，与日历工具栏 Find 无关） */
   const [sidebarNameQuery, setSidebarNameQuery] = useState('');
+  /** 日历格内拜访条的 Find（仅影响日历上已排客户，与侧栏列表无关） */
+  const [calendarNameQuery, setCalendarNameQuery] = useState('');
   /** 侧栏多选：每行单独 key（同 ACC 可并存） */
   const [sidebarSelectedRowKeys, setSidebarSelectedRowKeys] = useState(() => new Set());
+  /** 勾选时日历与侧栏 Area / Channel / Category 保持一致；未勾选则两套筛选独立（Find / Visits 仍各自独立） */
+  const [syncSidebarCalendarFilters, setSyncSidebarCalendarFilters] = useState(false);
   /** Summary / print: day-of-month range within the selected Year–Month */
   const [summaryDayFrom, setSummaryDayFrom] = useState(1);
   const [summaryDayTo, setSummaryDayTo] = useState(31);
@@ -766,11 +865,21 @@ function App() {
     if (!agent) return [];
     const set = new Set(
       customers
-        .filter((c) => c.agent === agent && (!area || c.area === area))
+        .filter((c) => c.agent === agent && (!sidebarArea || c.area === sidebarArea))
         .map((c) => String(c.channel ?? '—')),
     );
     return [...set].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base', numeric: true }));
-  }, [agent, area, customers]);
+  }, [agent, sidebarArea, customers]);
+
+  const calendarChannelOptions = useMemo(() => {
+    if (!agent) return [];
+    const set = new Set(
+      customers
+        .filter((c) => c.agent === agent && (!calendarArea || c.area === calendarArea))
+        .map((c) => String(c.channel ?? '—')),
+    );
+    return [...set].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base', numeric: true }));
+  }, [agent, calendarArea, customers]);
 
   const sidebarCategoryOptions = useMemo(() => {
     if (!agent) return [];
@@ -779,13 +888,28 @@ function App() {
         .filter(
           (c) =>
             c.agent === agent &&
-            (!area || c.area === area) &&
-            (!channelFilter || String(c.channel ?? '—') === channelFilter),
+            (!sidebarArea || c.area === sidebarArea) &&
+            (!sidebarChannelFilter || String(c.channel ?? '—') === sidebarChannelFilter),
         )
         .map((c) => String(c.category ?? '—')),
     );
     return [...set].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base', numeric: true }));
-  }, [agent, area, channelFilter, customers]);
+  }, [agent, sidebarArea, sidebarChannelFilter, customers]);
+
+  const calendarCategoryOptions = useMemo(() => {
+    if (!agent) return [];
+    const set = new Set(
+      customers
+        .filter(
+          (c) =>
+            c.agent === agent &&
+            (!calendarArea || c.area === calendarArea) &&
+            (!calendarChannelFilter || String(c.channel ?? '—') === calendarChannelFilter),
+        )
+        .map((c) => String(c.category ?? '—')),
+    );
+    return [...set].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base', numeric: true }));
+  }, [agent, calendarArea, calendarChannelFilter, customers]);
 
   const visitCountsTotal = useMemo(() => {
     const counts = {};
@@ -819,11 +943,11 @@ function App() {
     return customers.filter(
       (c) =>
         c.agent === agent &&
-        (!area || c.area === area) &&
-        (!channelFilter || String(c.channel ?? '—') === channelFilter) &&
-        (!categoryFilter || String(c.category ?? '—') === categoryFilter),
+        (!sidebarArea || c.area === sidebarArea) &&
+        (!sidebarChannelFilter || String(c.channel ?? '—') === sidebarChannelFilter) &&
+        (!sidebarCategoryFilter || String(c.category ?? '—') === sidebarCategoryFilter),
     );
-  }, [agent, area, channelFilter, categoryFilter, customers]);
+  }, [agent, sidebarArea, sidebarChannelFilter, sidebarCategoryFilter, customers]);
 
   const sidebarListedCustomers = useMemo(
     () =>
@@ -834,7 +958,7 @@ function App() {
   );
 
   const sidebarDisplayedCustomers = useMemo(() => {
-    const raw = sidebarNameQuery.trim().toLowerCase();
+    const raw = normalizeSidebarSearchPiece(sidebarNameQuery);
     const byNameThenAcc = (a, b) => {
       const o = String(a.name ?? '').localeCompare(String(b.name ?? ''), undefined, {
         sensitivity: 'base',
@@ -847,34 +971,85 @@ function App() {
       });
     };
 
+    /** 输入 Find 时在「整条名单」里搜（仍会受 Agent/Area/Channel/Category 制约），避免因 Visits（如 Exactly 2）把尚无排期的新客先筛掉而导致搜不到 */
+    const sourceForFind = raw ? sidebarBaseCustomers : sidebarListedCustomers;
+
     let list =
       !raw
         ? [...sidebarListedCustomers]
-        : sidebarListedCustomers.filter((c) => {
-            const nm = String(c.name ?? '').toLowerCase();
-            const ac = String(c.acc ?? '').toLowerCase();
+        : sourceForFind.filter((c) => {
+            const nm = normalizeSidebarSearchPiece(c.name);
+            const ac = normalizeSidebarSearchPiece(c.acc);
             return nm.includes(raw) || ac.includes(raw);
           });
 
     list.sort(byNameThenAcc);
     return list;
-  }, [sidebarListedCustomers, sidebarNameQuery]);
+  }, [sidebarBaseCustomers, sidebarListedCustomers, sidebarNameQuery]);
 
   useEffect(() => {
     setSidebarSelectedRowKeys(new Set());
     setSidebarNameQuery('');
-    setChannelFilter('');
-    setCategoryFilter('');
+    setCalendarNameQuery('');
+    setSidebarArea('');
+    setSidebarChannelFilter('');
+    setSidebarCategoryFilter('');
+    setCalendarArea('');
+    setCalendarChannelFilter('');
+    setCalendarCategoryFilter('');
+    setSyncSidebarCalendarFilters(false);
   }, [agent]);
 
   useEffect(() => {
-    setChannelFilter('');
-    setCategoryFilter('');
-  }, [area]);
+    setSidebarChannelFilter('');
+    setSidebarCategoryFilter('');
+  }, [sidebarArea]);
 
   useEffect(() => {
-    setCategoryFilter('');
-  }, [channelFilter]);
+    setSidebarCategoryFilter('');
+  }, [sidebarChannelFilter]);
+
+  useEffect(() => {
+    setCalendarChannelFilter('');
+    setCalendarCategoryFilter('');
+  }, [calendarArea]);
+
+  useEffect(() => {
+    setCalendarCategoryFilter('');
+  }, [calendarChannelFilter]);
+
+  /** Sidebar ⇄ Calendar：Area / Channel / Category + Find 搜尋字串雙向同步（Sync 打勾時） */
+  useEffect(() => {
+    if (!syncSidebarCalendarFilters) return;
+    setCalendarArea(sidebarArea);
+  }, [syncSidebarCalendarFilters, sidebarArea]);
+
+  useEffect(() => {
+    if (!syncSidebarCalendarFilters) return;
+    setSidebarArea(calendarArea);
+  }, [syncSidebarCalendarFilters, calendarArea]);
+
+  useEffect(() => {
+    if (!syncSidebarCalendarFilters) return;
+    setCalendarChannelFilter(sidebarChannelFilter);
+    setCalendarCategoryFilter(sidebarCategoryFilter);
+  }, [syncSidebarCalendarFilters, sidebarChannelFilter, sidebarCategoryFilter]);
+
+  useEffect(() => {
+    if (!syncSidebarCalendarFilters) return;
+    setSidebarChannelFilter(calendarChannelFilter);
+    setSidebarCategoryFilter(calendarCategoryFilter);
+  }, [syncSidebarCalendarFilters, calendarChannelFilter, calendarCategoryFilter]);
+
+  useEffect(() => {
+    if (!syncSidebarCalendarFilters) return;
+    setCalendarNameQuery(sidebarNameQuery);
+  }, [syncSidebarCalendarFilters, sidebarNameQuery]);
+
+  useEffect(() => {
+    if (!syncSidebarCalendarFilters) return;
+    setSidebarNameQuery(calendarNameQuery);
+  }, [syncSidebarCalendarFilters, calendarNameQuery]);
 
   const sidebarSelectAllRef = useRef(null);
   useEffect(() => {
@@ -909,10 +1084,10 @@ function App() {
     return monthWeekSlots(fd, td);
   }, [year, month]);
 
+  /** Summary 日与年月绑定：若仅就地 clamp「至」某日，到过短月后「至」会一直偏低，长月份就看不到末尾几天 */
   useEffect(() => {
-    const dm = daysInMonth;
-    setSummaryDayFrom((f) => Math.min(Math.max(1, f), dm));
-    setSummaryDayTo((t) => Math.min(Math.max(1, t), dm));
+    setSummaryDayFrom(1);
+    setSummaryDayTo(daysInMonth);
   }, [year, month, daysInMonth]);
 
   const summaryPrintRange = useMemo(() => {
@@ -932,28 +1107,28 @@ function App() {
     return map;
   }, [customers]);
 
-  /** 日历格内拜访条：Area / Channel / Category / Find 与侧栏共用；条形序号用 calendarChipRoundFilter */
+  /** 日历格内拜访条：日历专用 Area / Channel / Category / Find；条形序号用 calendarChipRoundFilter */
   const calendarFilterAcc = useCallback(
     (acc) => {
       const c = customerByAcc[acc];
       if (!c) return true;
-      if (area && c.area !== area) return false;
-      if (channelFilter && String(c.channel ?? '—') !== channelFilter) return false;
-      if (categoryFilter && String(c.category ?? '—') !== categoryFilter) return false;
-      const raw = sidebarNameQuery.trim().toLowerCase();
+      if (calendarArea && c.area !== calendarArea) return false;
+      if (calendarChannelFilter && String(c.channel ?? '—') !== calendarChannelFilter) return false;
+      if (calendarCategoryFilter && String(c.category ?? '—') !== calendarCategoryFilter) return false;
+      const raw = normalizeSidebarSearchPiece(calendarNameQuery);
       if (raw) {
-        const nm = String(c.name ?? '').toLowerCase();
-        const ac = String(acc ?? '').toLowerCase();
+        const nm = normalizeSidebarSearchPiece(c.name);
+        const ac = normalizeSidebarSearchPiece(acc);
         if (!nm.includes(raw) && !ac.includes(raw)) return false;
       }
       return true;
     },
     [
       customerByAcc,
-      area,
-      channelFilter,
-      categoryFilter,
-      sidebarNameQuery,
+      calendarArea,
+      calendarChannelFilter,
+      calendarCategoryFilter,
+      calendarNameQuery,
     ],
   );
 
@@ -1053,7 +1228,19 @@ function App() {
       from === 1 && to === daysInMonth ? monthLabel : `${monthLabel}, days ${from}–${to}`;
 
     return (
-      <div className="summary-print-wrap" style={{ flex: 1, overflow: 'auto', width: '100%', boxSizing: 'border-box', padding: '20px', display: 'flex', flexDirection: 'column', gap: '20px' }}>
+      <div
+        className="summary-print-wrap"
+        style={{
+          width: '100%',
+          alignSelf: 'stretch',
+          flexShrink: 0,
+          boxSizing: 'border-box',
+          padding: '20px',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '20px',
+        }}
+      >
         <div className="summary-print-page-title">
           Schedule summary · {summaryRangeTitle}
           {agent ? ` · ${agent}` : ''}
@@ -1125,12 +1312,21 @@ function App() {
   };
 
   const mapImportedRowsToCustomers = (data) =>
-    data.map((r) => {
+    data.map((r, idx) => {
       const ks = Object.keys(r);
       const f = (ts) => ks.find((k) => ts.some((t) => k.toUpperCase().includes(t.toUpperCase())));
+      const nameKey = pickDebtorNameColumnKey(ks);
+      const rawName = nameKey != null ? r[nameKey] : undefined;
+      const name =
+        rawName != null && String(rawName).trim() !== '' ? String(rawName).trim() : 'N/A';
+      const rawAcc = r[f(['ACC NO', 'ACCOUNT'])];
+      const accTrimmed = rawAcc != null ? String(rawAcc).trim() : '';
+      /** 試算表格內留白：舊版一律變「N/A」會變成一樣嘅字串，duplicate 檢查會報錯、整份匯入失敗且無唯一客戶鍵 */
+      const acc =
+        accTrimmed !== '' ? accTrimmed : `NOACC-${idx + 1}`;
       return {
-        acc: r[f(['ACC NO', 'ACCOUNT'])] || 'N/A',
-        name: r[f(['DEBTOR NAME', 'NAME'])] || 'N/A',
+        acc,
+        name,
         area: r[f(['AREA'])] || 'OTHER',
         agent: r[f(['SALES AGENT', 'AGENT'])] || 'UNASSIGNED',
         channel: normalizeImportField(r[f(['CHANNEL'])]),
@@ -1172,13 +1368,33 @@ function App() {
           if (input && typeof input.value === 'string') input.value = '';
           return;
         }
+        let droppedAfterMerge = 0;
         setCustomers(mapped);
         setImportFileName(file.name ?? '');
-        setSchedules({});
+        setSchedules((prev) => {
+          const merged = mergeSchedulesAfterCustomerReimport(prev, mapped);
+          droppedAfterMerge = merged.droppedVisits;
+          return merged.schedules;
+        });
         /** 新来的客多为 0 次拜访；沿用「Exactly N visits」会像被吃掉一样 */
         setSidebarVisitCountFilter('all');
         setCalendarChipRoundFilter('all');
+        setSidebarArea('');
+        setCalendarArea('');
+        setSidebarChannelFilter('');
+        setSidebarCategoryFilter('');
+        setCalendarChannelFilter('');
+        setCalendarCategoryFilter('');
         setSidebarNameQuery('');
+        setCalendarNameQuery('');
+        setSyncSidebarCalendarFilters(false);
+        if (droppedAfterMerge > 0) {
+          window.alert(
+            `Imported ${mapped.length} customers.\n\n` +
+              `Calendar visits were kept for every account still listed in this file (dates and visit # unchanged; names refreshed from the sheet).\n\n` +
+              `${droppedAfterMerge} visit${droppedAfterMerge === 1 ? '' : 's'} had to be dropped because ${droppedAfterMerge === 1 ? 'that account is' : 'those accounts are'} no longer in the spreadsheet.`,
+          );
+        }
         if (input && typeof input.value === 'string') input.value = '';
       } catch (err) {
         console.error(err);
@@ -1213,12 +1429,17 @@ function App() {
     setImportFileName('');
     setSchedules({});
     setAgent('');
-    setArea('');
     setSidebarVisitCountFilter('all');
     setCalendarChipRoundFilter('all');
-    setChannelFilter('');
-    setCategoryFilter('');
+    setSidebarArea('');
+    setCalendarArea('');
+    setSidebarChannelFilter('');
+    setSidebarCategoryFilter('');
+    setCalendarChannelFilter('');
+    setCalendarCategoryFilter('');
     setSidebarNameQuery('');
+    setCalendarNameQuery('');
+    setSyncSidebarCalendarFilters(false);
     setSidebarSelectedRowKeys(new Set());
     setFocusedDay(null);
     const inp = document.getElementById('route-data-import');
@@ -1611,7 +1832,6 @@ function App() {
             value={agent}
             onChange={(e) => {
               setAgent(e.target.value);
-              setArea('');
               setSidebarVisitCountFilter('all');
               setCalendarChipRoundFilter('all');
             }}
@@ -1628,12 +1848,14 @@ function App() {
 
         <div style={{ display: 'flex', gap: '6px', marginBottom: '9px', alignItems: 'stretch', minWidth: 0 }}>
           <div style={{ flex: '1 1 50%', minWidth: 0, display: 'flex', flexDirection: 'column' }}>
-            <label style={sidebarSectionLabel} htmlFor="sidebar-area">3. Area</label>
+            <label style={sidebarSectionLabel} htmlFor="sidebar-area">
+              3. Area <span style={{ fontWeight: 600, opacity: 0.85, textTransform: 'none', letterSpacing: 'normal' }}>(sidebar)</span>
+            </label>
             <select
               id="sidebar-area"
               className="sidebar-select"
-              value={area}
-              onChange={(e) => setArea(e.target.value)}
+              value={sidebarArea}
+              onChange={(e) => setSidebarArea(e.target.value)}
               style={{ ...selectSidebarStyle, marginBottom: 0 }}
               disabled={!agent}
             >
@@ -1669,12 +1891,14 @@ function App() {
 
         <div style={{ display: 'flex', gap: '6px', marginBottom: '9px', alignItems: 'stretch', minWidth: 0 }}>
           <div style={{ flex: '1 1 50%', minWidth: 0, display: 'flex', flexDirection: 'column' }}>
-            <label style={sidebarSectionLabel} htmlFor="sidebar-channel">5. Channel</label>
+            <label style={sidebarSectionLabel} htmlFor="sidebar-channel">
+              5. Channel <span style={{ fontWeight: 600, opacity: 0.85, textTransform: 'none', letterSpacing: 'normal' }}>(sidebar)</span>
+            </label>
             <select
               id="sidebar-channel"
               className="sidebar-select"
-              value={channelFilter}
-              onChange={(e) => setChannelFilter(e.target.value)}
+              value={sidebarChannelFilter}
+              onChange={(e) => setSidebarChannelFilter(e.target.value)}
               style={{ ...selectSidebarStyle, marginBottom: 0 }}
               disabled={!agent}
             >
@@ -1685,12 +1909,14 @@ function App() {
             </select>
           </div>
           <div style={{ flex: '1 1 50%', minWidth: 0, display: 'flex', flexDirection: 'column' }}>
-            <label style={sidebarSectionLabel} htmlFor="sidebar-category">6. Category</label>
+            <label style={sidebarSectionLabel} htmlFor="sidebar-category">
+              6. Category <span style={{ fontWeight: 600, opacity: 0.85, textTransform: 'none', letterSpacing: 'normal' }}>(sidebar)</span>
+            </label>
             <select
               id="sidebar-category"
               className="sidebar-select"
-              value={categoryFilter}
-              onChange={(e) => setCategoryFilter(e.target.value)}
+              value={sidebarCategoryFilter}
+              onChange={(e) => setSidebarCategoryFilter(e.target.value)}
               style={{ ...selectSidebarStyle, marginBottom: 0 }}
               disabled={!agent}
             >
@@ -1704,16 +1930,16 @@ function App() {
 
         <div style={{ marginBottom: '9px', minWidth: 0 }}>
           <label style={sidebarSectionLabel} htmlFor="sidebar-name-search">
-            7. Find customer
+            7. Find customer <span style={{ fontWeight: 600, opacity: 0.85, textTransform: 'none', letterSpacing: 'normal' }}>(sidebar list)</span>
           </label>
           <input
             id="sidebar-name-search"
             type="search"
             autoCapitalize="off"
             spellCheck={false}
-            aria-label="Filter customers by name or account"
+            aria-label="Filter sidebar customer list by name or account"
             value={sidebarNameQuery}
-            placeholder={agent ? 'Type name or account…' : '— Select agent first —'}
+            placeholder={agent ? 'Search by name or account #…' : '— Select agent first —'}
             disabled={!agent}
             onChange={(e) => setSidebarNameQuery(e.target.value)}
             style={{
@@ -1733,7 +1959,7 @@ function App() {
           />
           {agent && sidebarNameQuery.trim().length > 0 && (
             <div style={{ marginTop: '3px', fontSize: '8px', color: 'rgba(148, 163, 184, 0.85)', lineHeight: 1.35 }}>
-              Showing {sidebarDisplayedCustomers.length} of {sidebarListedCustomers.length} in list
+              {sidebarDisplayedCustomers.length} match{sidebarDisplayedCustomers.length === 1 ? '' : 'es'} · Visit count filter ignored while typing (Area / Channel / Category still apply)
             </div>
           )}
         </div>
@@ -1969,7 +2195,7 @@ function App() {
         </div>
 
         <div className="main-scroll-region" style={{ flex: 1, minHeight: 0, minWidth: 0, overflowY: 'auto', overflowX: 'hidden', padding: '14px 16px', display: 'flex', flexDirection: 'column' }}>
-          <div className="schedule-strip-print" style={{ background: '#1e293b', color: 'white', padding: '15px 25px', borderRadius: '12px 12px 0 0', fontWeight: 'bold', display:'flex', justifyContent:'space-between', alignItems: 'center', gap: '12px', flexWrap: 'wrap', width: '100%', boxSizing: 'border-box' }}>
+          <div className="schedule-strip-print" style={{ flexShrink: 0, background: '#1e293b', color: 'white', padding: '15px 25px', borderRadius: '12px 12px 0 0', fontWeight: 'bold', display:'flex', justifyContent:'space-between', alignItems: 'center', gap: '12px', flexWrap: 'wrap', width: '100%', boxSizing: 'border-box' }}>
             <span style={{ minWidth: 0 }}>AGENT: {agent || 'NOT SELECTED'}</span>
             <div className="no-print" style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
               <label style={{ fontSize: '11px', fontWeight: 600, opacity: 0.75, textTransform: 'uppercase', marginRight: '2px' }}>Year</label>
@@ -2087,7 +2313,6 @@ function App() {
                         value={agent}
                         onChange={(e) => {
               setAgent(e.target.value);
-              setArea('');
               setSidebarVisitCountFilter('all');
               setCalendarChipRoundFilter('all');
             }}
@@ -2101,12 +2326,71 @@ function App() {
                         ))}
                       </select>
                     </label>
+                    <label
+                      htmlFor="cal-filter-sync-checkbox"
+                      title="When Sync is on, Area / Channel / Category and the Find search text mirror the sidebar (and vice versa). Sidebar Visits count & calendar chip # filters stay separate."
+                      style={{
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '4px',
+                        minWidth: '0',
+                        flex: '0 0 auto',
+                        justifyContent: 'flex-end',
+                        cursor: agent ? 'pointer' : 'not-allowed',
+                      }}
+                    >
+                      <span style={{ fontSize: '10px', fontWeight: 700, color: '#64748b', textTransform: 'uppercase', lineHeight: 1 }}>
+                        Sync
+                      </span>
+                      <div
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '8px',
+                          padding: '4px 0',
+                          minHeight: '34px',
+                          boxSizing: 'border-box',
+                        }}
+                      >
+                        <input
+                          id="cal-filter-sync-checkbox"
+                          type="checkbox"
+                          checked={syncSidebarCalendarFilters}
+                          disabled={!agent}
+                          onChange={(e) => {
+                            const on = e.target.checked;
+                            if (on && agent) {
+                              setCalendarArea(sidebarArea);
+                              setCalendarChannelFilter(sidebarChannelFilter);
+                              setCalendarCategoryFilter(sidebarCategoryFilter);
+                              setCalendarNameQuery(sidebarNameQuery);
+                            }
+                            setSyncSidebarCalendarFilters(on);
+                          }}
+                          style={{ width: '15px', height: '15px', accentColor: '#2563eb', cursor: agent ? 'pointer' : 'not-allowed', flexShrink: 0 }}
+                        />
+                        <span
+                          style={{
+                            fontSize: '11px',
+                            fontWeight: 600,
+                            color: '#334155',
+                            userSelect: 'none',
+                            lineHeight: 1.2,
+                            maxWidth: '72px',
+                          }}
+                        >
+                          same as sidebar
+                        </span>
+                      </div>
+                    </label>
                     <label style={{ display: 'flex', flexDirection: 'column', gap: '4px', minWidth: '0', flex: '1 1 110px' }}>
-                      <span style={{ fontSize: '10px', fontWeight: 700, color: '#64748b', textTransform: 'uppercase' }}>Area</span>
+                      <span style={{ fontSize: '10px', fontWeight: 700, color: '#64748b', textTransform: 'uppercase' }}>
+                        Area <span style={{ fontWeight: 600, textTransform: 'none' }}>(calendar)</span>
+                      </span>
                       <select
-                        aria-label="Area filter"
-                        value={area}
-                        onChange={(e) => setArea(e.target.value)}
+                        aria-label="Calendar area filter"
+                        value={calendarArea}
+                        onChange={(e) => setCalendarArea(e.target.value)}
                         style={{ ...selectCalendarToolbarStyle, width: '100%' }}
                         disabled={!agent}
                       >
@@ -2137,42 +2421,46 @@ function App() {
                       </select>
                     </label>
                     <label style={{ display: 'flex', flexDirection: 'column', gap: '4px', minWidth: '0', flex: '1 1 110px' }}>
-                      <span style={{ fontSize: '10px', fontWeight: 700, color: '#64748b', textTransform: 'uppercase' }}>Channel</span>
+                      <span style={{ fontSize: '10px', fontWeight: 700, color: '#64748b', textTransform: 'uppercase' }}>
+                        Channel <span style={{ fontWeight: 600, textTransform: 'none' }}>(calendar)</span>
+                      </span>
                       <select
-                        aria-label="Channel filter"
-                        value={channelFilter}
-                        onChange={(e) => setChannelFilter(e.target.value)}
+                        aria-label="Calendar channel filter"
+                        value={calendarChannelFilter}
+                        onChange={(e) => setCalendarChannelFilter(e.target.value)}
                         style={{ ...selectCalendarToolbarStyle, width: '100%' }}
                         disabled={!agent}
                       >
                         <option value="">{agent ? '— All channels —' : '— Agent first —'}</option>
-                        {sidebarChannelOptions.map((ch) => (
+                        {calendarChannelOptions.map((ch) => (
                           <option key={ch} value={ch}>{ch}</option>
                         ))}
                       </select>
                     </label>
                     <label style={{ display: 'flex', flexDirection: 'column', gap: '4px', minWidth: '0', flex: '1 1 110px' }}>
-                      <span style={{ fontSize: '10px', fontWeight: 700, color: '#64748b', textTransform: 'uppercase' }}>Category</span>
+                      <span style={{ fontSize: '10px', fontWeight: 700, color: '#64748b', textTransform: 'uppercase' }}>
+                        Category <span style={{ fontWeight: 600, textTransform: 'none' }}>(calendar)</span>
+                      </span>
                       <select
-                        aria-label="Category filter"
-                        value={categoryFilter}
-                        onChange={(e) => setCategoryFilter(e.target.value)}
+                        aria-label="Calendar category filter"
+                        value={calendarCategoryFilter}
+                        onChange={(e) => setCalendarCategoryFilter(e.target.value)}
                         style={{ ...selectCalendarToolbarStyle, width: '100%' }}
                         disabled={!agent}
                       >
                         <option value="">{agent ? '— All categories —' : '— Agent first —'}</option>
-                        {sidebarCategoryOptions.map((cat) => (
+                        {calendarCategoryOptions.map((cat) => (
                           <option key={cat} value={cat}>{cat}</option>
                         ))}
                       </select>
                     </label>
                     <label style={{ display: 'flex', flexDirection: 'column', gap: '4px', minWidth: '0', flex: '1 1 200px' }}>
-                      <span style={{ fontSize: '10px', fontWeight: 700, color: '#64748b', textTransform: 'uppercase' }}>Find</span>
+                      <span style={{ fontSize: '10px', fontWeight: 700, color: '#64748b', textTransform: 'uppercase' }}>Find on calendar</span>
                       <input
                         type="search"
-                        aria-label="Filter calendar chips by customer name or account"
-                        value={sidebarNameQuery}
-                        onChange={(e) => setSidebarNameQuery(e.target.value)}
+                        aria-label="Filter calendar visits by name or account (sidebar list uses the left panel Find)"
+                        value={calendarNameQuery}
+                        onChange={(e) => setCalendarNameQuery(e.target.value)}
                         placeholder={agent ? 'Name or account…' : 'Agent first'}
                         disabled={!agent}
                         autoCapitalize="off"
