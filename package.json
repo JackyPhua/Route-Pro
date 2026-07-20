@@ -1,7 +1,7 @@
 {
   "name": "route-planner",
   "private": true,
-  "version": "1.1.4",
+  "version": "1.1.11",
   "description": "Sales route planner — import customers, drag visits onto the calendar.",
   "author": "JackyPhua",
   "type": "module",
@@ -14,10 +14,12 @@
     "electron:dist": "npm run build:electron && electron-builder --win portable",
     "electron:dist:setup": "npm run build:electron && electron-builder --win nsis",
     "electron:dist:all": "npm run build:electron && electron-builder --win portable nsis",
+    "electron:publish": "npm run build:electron && electron-builder --win nsis --publish always",
     "lint": "eslint .",
     "preview": "vite preview"
   },
   "dependencies": {
+    "electron-updater": "^6.6.2",
     "lucide-react": "^1.14.0",
     "papaparse": "^5.5.3",
     "react": "^19.2.5",
@@ -29,13 +31,13 @@
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.1",
+    "electron": "^34.5.8",
+    "electron-builder": "^26.8.1",
     "eslint": "^10.2.1",
     "eslint-plugin-react-hooks": "^7.1.1",
     "eslint-plugin-react-refresh": "^0.5.2",
     "globals": "^17.5.0",
-    "vite": "^8.0.10",
-    "electron": "^34.5.8",
-    "electron-builder": "^26.8.1"
+    "vite": "^8.0.10"
   },
   "build": {
     "appId": "com.routeplanner.app",
@@ -53,11 +55,15 @@
       "target": [
         {
           "target": "portable",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         },
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ]
     },
@@ -68,6 +74,14 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "Route Planner"
-    }
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "JackyPhua",
+        "repo": "Route-Pro",
+        "releaseType": "release"
+      }
+    ]
   }
 }

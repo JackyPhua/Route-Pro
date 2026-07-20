@@ -2,6 +2,47 @@ const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const fs = require('fs');
 const path = require('path');
 
+/** GitHub Releases auto-update (NSIS installed build only; skipped in dev / portable). */
+function setupAutoUpdate(win) {
+  if (!app.isPackaged || process.platform !== 'win32') return;
+  try {
+    const { autoUpdater } = require('electron-updater');
+    autoUpdater.autoDownload = true;
+    autoUpdater.autoInstallOnAppQuit = true;
+
+    autoUpdater.on('error', (err) => {
+      console.warn('route-planner: autoUpdater error', err?.message ?? err);
+    });
+
+    autoUpdater.on('update-downloaded', (info) => {
+      const parent =
+        win && !win.isDestroyed() ? win : BrowserWindow.getFocusedWindow() ?? undefined;
+      dialog
+        .showMessageBox(parent, {
+          type: 'info',
+          title: 'Route Planner update',
+          message: `Version ${info.version} is ready to install.`,
+          detail: 'Restart now to apply the update, or choose Later to install on next exit.',
+          buttons: ['Restart now', 'Later'],
+          defaultId: 0,
+          cancelId: 1,
+        })
+        .then(({ response }) => {
+          if (response === 0) autoUpdater.quitAndInstall(false, true);
+        })
+        .catch(() => {});
+    });
+
+    setTimeout(() => {
+      autoUpdater.checkForUpdates().catch((err) => {
+        console.warn('route-planner: checkForUpdates failed', err?.message ?? err);
+      });
+    }, 8000);
+  } catch (err) {
+    console.warn('route-planner: autoUpdater unavailable', err?.message ?? err);
+  }
+}
+
 const DATA_FILENAME = 'route-planner-state.json';
 
 /** 部分電腦獨顯／驅動會間歇性空白渲染；使用者可在捷徑或系統環境變數設 ROUTE_PLANNER_DISABLE_GPU=1 */
@@ -68,6 +109,9 @@ function attachRendererDiagnostics(win) {
   });
 }
 
+/** @type {import('electron').BrowserWindow | null} */
+let mainWindow = null;
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1360,
@@ -83,9 +127,17 @@ function createWindow() {
     show: false,
   });
 
+  mainWindow = win;
+  win.on('closed', () => {
+    if (mainWindow === win) mainWindow = null;
+  });
+
   attachRendererDiagnostics(win);
 
-  win.once('ready-to-show', () => win.show());
+  win.once('ready-to-show', () => {
+    win.maximize();
+    win.show();
+  });
 
   const html = path.join(__dirname, '..', 'dist', 'index.html');
   win.loadFile(html).catch((err) => {
@@ -110,15 +162,37 @@ app.whenReady().then(() => {
       throw err;
     }
   });
-  ipcMain.on('route-planner:save-sync', (_e, json) => {
+  ipcMain.on('route-planner:save-sync', (event, json) => {
     try {
       writeStore(json);
     } catch (err) {
       console.error('route-planner: sync save failed', err);
     }
+    /** sendSync 須設定 returnValue ，否則渲染進程可能一直阻塞 → 對話框不关、視窗似「當機」 */
+    event.returnValue = null;
+  });
+
+  /** 原生 alert / 覆蓋層後部分環境鍵盤焦點留在 OS ，需把焦點拉回視窗與 webContents（等同使用者 minimize 再開） */
+  ipcMain.on('route-planner:focus-window', (event) => {
+    try {
+      const w =
+        mainWindow && !mainWindow.isDestroyed()
+          ? mainWindow
+          : BrowserWindow.getAllWindows()[0];
+      if (!w || w.isDestroyed()) return;
+      if (w.isMinimized()) w.restore();
+      w.show();
+      w.focus();
+      w.webContents.focus();
+    } catch (err) {
+      console.warn('route-planner: focus-window failed', err);
+    }
+    /** sendSync 須設定 returnValue ，否則渲染進程會阻塞 */
+    event.returnValue = null;
   });
 
   createWindow();
+  if (mainWindow) setupAutoUpdate(mainWindow);
 });
 
 app.on('window-all-closed', () => {

@@ -1,9 +1,18 @@
 import { useState, useMemo, useEffect, useRef, useLayoutEffect, useCallback } from 'react';
 import { Upload } from 'lucide-react';
 import * as XLSX from 'xlsx';
+import packageJson from '../package.json';
+import {
+  saveCachedSpreadsheet,
+  loadCachedSpreadsheet,
+  clearCachedSpreadsheet,
+  patchCachedSpreadsheetSheetIndex,
+} from './importWorkbookCache.js';
+import { sabahHolidayNameForCalendarDate, advanceIsoPastSundaysAndPublicHolidays } from './malaysiaSabahCalendarHolidays.js';
 
-const SABAH_HOLIDAYS = { "2026-05-01": "Labour Day", "2026-05-30": "Kaamatan", "2026-05-31": "Kaamatan" };
 const MONTH_SHORT = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+
+const WEEKDAY_ABBREV_SUN0 = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 const YEAR_RANGE = Array.from({ length: 2032 - 2023 + 1 }, (_, i) => 2023 + i);
 
@@ -147,6 +156,269 @@ function formatIsoDateHeading(iso) {
   } catch {
     return String(iso);
   }
+}
+
+/**
+ * ISO yyyy-mm-dd interpreted in the **local** calendar (avoid `new Date('yyyy-mm-dd')`, which is UTC midnight
+ * and can show the wrong weekday west of Greenwich).
+ */
+function localWeekdayIndexFromIso(iso) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso).trim());
+  if (!m) return NaN;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const d = Number(m[3]);
+  return new Date(y, mo - 1, d).getDay();
+}
+
+/** Sun … Sat abbreviated label for yyyy-mm-dd in local TZ */
+function weekdayAbbrevFromIso(dateStr) {
+  const wd = localWeekdayIndexFromIso(dateStr);
+  if (!Number.isFinite(wd) || wd < 0 || wd > 6) return '—';
+  return WEEKDAY_ABBREV_SUN0[wd];
+}
+
+/** ISO yyyy-mm-dd plus one calendar month in local timezone
+ * (e.g. Jan 31 → Feb 28/29 per JS Date rollover rules).
+ */
+function addOneCalendarMonthToIsoDate(dateStr) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateStr).trim());
+  if (!m) return null;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const d = Number(m[3]);
+  if (!Number.isFinite(y) || !Number.isFinite(mo) || !Number.isFinite(d)) return null;
+  const dt = new Date(y, mo - 1, d);
+  if (dt.getFullYear() !== y || dt.getMonth() !== mo - 1 || dt.getDate() !== d) return null;
+  dt.setMonth(dt.getMonth() + 1);
+  const ny = dt.getFullYear();
+  const nmo = String(dt.getMonth() + 1).padStart(2, '0');
+  const nd = String(dt.getDate()).padStart(2, '0');
+  return `${ny}-${nmo}-${nd}`;
+}
+
+function formatYyyyMmDdLocal(dt) {
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, '0');
+  const d = String(dt.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+/**
+ * Company policy: skip Sundays when placing copied visits → move target to Monday (+1 calendar day locally).
+ * If that Monday falls outside the intended month (e.g. Jun 29 Sun→Jun 30 Mon OK; theoretical Jun 30 Sun→Jul 1), callers may still persist that date (see duplicate fn).
+ */
+function bumpSundayCopiedVisitToMondayYyyyMmDd(dateStr) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateStr).trim());
+  if (!m) return dateStr;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const d = Number(m[3]);
+  const dt = new Date(y, mo - 1, d);
+  if (dt.getFullYear() !== y || dt.getMonth() !== mo - 1 || dt.getDate() !== d) return dateStr;
+  if (dt.getDay() !== 0) return dateStr;
+  dt.setDate(dt.getDate() + 1);
+  return formatYyyyMmDdLocal(dt);
+}
+
+/** True if yyyy-mm-dd is a Sunday in local timezone. */
+function isoYyyyMmDdIsSundayLocal(dateStr) {
+  return localWeekdayIndexFromIso(dateStr) === 0;
+}
+
+/**
+ * For one agent+year+month: every visit scheduled on Sunday moves to Monday (merge per day; skip duplicate acc).
+ * Mondays may spill to the next calendar month (rare month-end Sunday).
+ */
+function moveSundayVisitsToMondayForAgentMonth(prevSchedules, agentKey, yearVal, month0) {
+  if (!prevSchedules || typeof prevSchedules !== 'object') {
+    return {
+      next: prevSchedules,
+      changed: false,
+      sundayDatesTouched: 0,
+      movedVisits: 0,
+      skippedDup: 0,
+    };
+  }
+  const byDate = prevSchedules[agentKey];
+  if (!byDate || typeof byDate !== 'object') {
+    return {
+      next: prevSchedules,
+      changed: false,
+      sundayDatesTouched: 0,
+      movedVisits: 0,
+      skippedDup: 0,
+    };
+  }
+
+  const prefix = `${yearVal}-${String(month0 + 1).padStart(2, '0')}-`;
+  const sundayKeys = Object.keys(byDate).filter(
+    (k) => typeof k === 'string' && k.startsWith(prefix) && isoYyyyMmDdIsSundayLocal(k),
+  ).sort();
+
+  if (sundayKeys.length === 0) {
+    return {
+      next: prevSchedules,
+      changed: false,
+      sundayDatesTouched: 0,
+      movedVisits: 0,
+      skippedDup: 0,
+    };
+  }
+
+  const agentSched = {};
+  for (const k of Object.keys(byDate)) agentSched[k] = [...byDate[k]];
+
+  let movedVisits = 0;
+  let skippedDup = 0;
+  let sundayDatesTouched = 0;
+  let mutated = false;
+
+  for (const sunKey of sundayKeys) {
+    const visits = agentSched[sunKey];
+    if (!Array.isArray(visits) || visits.length === 0) {
+      delete agentSched[sunKey];
+      mutated = true;
+      continue;
+    }
+    const monKey = bumpSundayCopiedVisitToMondayYyyyMmDd(sunKey);
+    if (monKey === sunKey) continue;
+
+    let monList = [...(agentSched[monKey] || [])];
+    const seen = new Set(monList.map((t) => t.acc));
+
+    for (const v of visits) {
+      if (!v || v.acc == null || String(v.acc).length === 0) continue;
+      const acc = String(v.acc);
+      if (seen.has(acc)) {
+        skippedDup += 1;
+        continue;
+      }
+      monList.push({
+        acc,
+        name: String(v.name ?? ''),
+        visitRound: normalizeVisitRound(v.visitRound ?? 1),
+      });
+      seen.add(acc);
+      movedVisits += 1;
+    }
+    agentSched[monKey] = monList;
+    delete agentSched[sunKey];
+    sundayDatesTouched += 1;
+    mutated = true;
+  }
+
+  if (!mutated) {
+    return {
+      next: prevSchedules,
+      changed: false,
+      sundayDatesTouched: 0,
+      movedVisits: 0,
+      skippedDup: 0,
+    };
+  }
+
+  const nextSchedules = normalizePersistedSchedules({ ...prevSchedules, [agentKey]: agentSched });
+  return {
+    next: nextSchedules,
+    changed: true,
+    sundayDatesTouched,
+    movedVisits,
+    skippedDup,
+  };
+}
+
+/** Copy one agent's visits from source month onto the following month (same day-of-month; bump past Sundays & yellow public holidays day-by-day; merges; skips dup acc per day). */
+function duplicateAgentMonthVisitsOneMonthAhead(prevSchedules, agentKey, yearVal, month0) {
+  if (!prevSchedules || typeof prevSchedules !== 'object') {
+    return {
+      next: prevSchedules,
+      changed: false,
+      added: 0,
+      skippedDup: 0,
+      sourceDatesShiftedFromBlockedDays: 0,
+      daysSpilledPastTargetMonth: 0,
+    };
+  }
+  const byDate = prevSchedules[agentKey];
+  if (!byDate || typeof byDate !== 'object') {
+    return {
+      next: prevSchedules,
+      changed: false,
+      added: 0,
+      skippedDup: 0,
+      sourceDatesShiftedFromBlockedDays: 0,
+      daysSpilledPastTargetMonth: 0,
+    };
+  }
+
+  const srcIsoPad = String(month0 + 1).padStart(2, '0');
+  const srcPrefix = `${yearVal}-${srcIsoPad}-`;
+  const nextMonthIdx = month0 === 11 ? 0 : month0 + 1;
+  const nextYearVal = month0 === 11 ? yearVal + 1 : yearVal;
+  const expectedYm = `${nextYearVal}-${String(nextMonthIdx + 1).padStart(2, '0')}`;
+
+  const agentSched = {};
+  for (const k of Object.keys(byDate)) agentSched[k] = [...byDate[k]];
+  let added = 0;
+  let skippedDup = 0;
+  let changed = false;
+  let sourceDatesShiftedFromBlockedDays = 0;
+  let daysSpilledPastTargetMonth = 0;
+
+  for (const [dateStr, visits] of Object.entries(byDate)) {
+    if (typeof dateStr !== 'string' || !dateStr.startsWith(srcPrefix)) continue;
+    if (!Array.isArray(visits) || visits.length === 0) continue;
+    const rawTarget = addOneCalendarMonthToIsoDate(dateStr);
+    if (!rawTarget) continue;
+    if (rawTarget.slice(0, 7) !== expectedYm) {
+      continue;
+    }
+    const targetStr = advanceIsoPastSundaysAndPublicHolidays(rawTarget);
+    if (targetStr !== rawTarget) sourceDatesShiftedFromBlockedDays += 1;
+    if (targetStr.slice(0, 7) !== expectedYm) daysSpilledPastTargetMonth += 1;
+
+    let tgtList = [...(agentSched[targetStr] || [])];
+    const seen = new Set(tgtList.map((t) => t.acc));
+
+    for (const v of visits) {
+      if (!v || v.acc == null || String(v.acc).length === 0) continue;
+      const acc = String(v.acc);
+      if (seen.has(acc)) {
+        skippedDup += 1;
+        continue;
+      }
+      tgtList.push({
+        acc,
+        name: String(v.name ?? ''),
+        visitRound: normalizeVisitRound(v.visitRound ?? 1),
+      });
+      seen.add(acc);
+      added += 1;
+      changed = true;
+    }
+    agentSched[targetStr] = tgtList;
+  }
+
+  if (!changed) {
+    return {
+      next: prevSchedules,
+      changed: false,
+      added: 0,
+      skippedDup,
+      sourceDatesShiftedFromBlockedDays: 0,
+      daysSpilledPastTargetMonth: 0,
+    };
+  }
+  const nextSchedules = normalizePersistedSchedules({ ...prevSchedules, [agentKey]: agentSched });
+  return {
+    next: nextSchedules,
+    changed: true,
+    added,
+    skippedDup,
+    sourceDatesShiftedFromBlockedDays,
+    daysSpilledPastTargetMonth,
+  };
 }
 
 /** 将序号映射到 1–6 配色桶（≥6 次均为桶 6） */
@@ -439,6 +711,13 @@ function CalWeekRow({
         }
         const { dayNum, dateStr, isSun, tasks } = cell;
         const isFocused = highlightedDayNum != null && highlightedDayNum === dayNum;
+        const holidayName = sabahHolidayNameForCalendarDate(dateStr);
+        const cellTitle =
+          holidayName != null
+            ? `${holidayName} (public holiday) · Double-click this day for the visit list`
+            : isSun
+              ? 'Sunday · often a weekly rest day or non-working day · Double-click for the visit list'
+              : 'Double-click this day for full customer names and accounts';
         return (
           <div
             key={cell.key}
@@ -451,14 +730,14 @@ function CalWeekRow({
               dropOnDate(dateStr, raw);
             }}
             onDoubleClick={() => onDayDoubleClick?.(dateStr)}
-            title="Double-click for full customer name and account"
+            title={cellTitle}
             style={{
               minHeight: '144px',
               display: 'flex',
               flexDirection: 'column',
               border: '1px solid #cbd5e1',
               padding: '10px',
-              background: SABAH_HOLIDAYS[dateStr] ? '#fef08a' : (isSun ? '#ffe4e6' : 'white'),
+              background: holidayName ? '#fef08a' : (isSun ? '#ffe4e6' : 'white'),
               position: 'relative',
               boxSizing: 'border-box',
               boxShadow: isFocused ? 'inset 0 0 0 2px #2563eb' : undefined,
@@ -484,10 +763,10 @@ function paletteForColorBucket(bucket) {
   return { ...UNSCHED_SIDEBAR, ...VISIT_BUCKET_PALETTE[b] };
 }
 
-/** 已排期总次数 → 侧栏用色（与最高桶一致） */
-function paletteForTotalVisits(total) {
-  if (total <= 0) return UNSCHED_SIDEBAR;
-  return paletteForColorBucket(Math.min(total, 6));
+/** Sidebar visit badge color: bucket from a non-negative integer (typically month visit count). */
+function paletteForVisitCountDisplay(n) {
+  if (n <= 0) return UNSCHED_SIDEBAR;
+  return paletteForColorBucket(Math.min(n, 6));
 }
 
 /** 侧栏「已排期次数」筛选 */
@@ -706,6 +985,33 @@ const IMPORT_STORE_KEY = 'route-planner:v1:import-data';
 /** 「Clear saved import」出廠預設密碼：使用者首次成功驗證後會改存於 localStorage（不清除 import 時仍保留） */
 const CLEAR_SAVED_IMPORT_PASSWORD = '1234';
 const CLEAR_CUSTOM_PASSWORD_KEY = 'route-planner:v1:clear-import-password-custom';
+const COMPANY_NAME_STORAGE_KEY = 'route-planner:v1:company-name';
+
+function loadStoredCompanyName() {
+  try {
+    if (typeof localStorage === 'undefined') return '';
+    const v = localStorage.getItem(COMPANY_NAME_STORAGE_KEY);
+    return v != null && String(v).trim().length > 0 ? String(v).trim() : '';
+  } catch {
+    return '';
+  }
+}
+
+function saveStoredCompanyName(name) {
+  try {
+    if (typeof localStorage === 'undefined') {
+      window.alert('Could not save settings (storage unavailable).');
+      return false;
+    }
+    const trimmed = String(name ?? '').trim();
+    if (trimmed === '') localStorage.removeItem(COMPANY_NAME_STORAGE_KEY);
+    else localStorage.setItem(COMPANY_NAME_STORAGE_KEY, trimmed);
+    return true;
+  } catch {
+    window.alert('Could not save settings (storage blocked or full).');
+    return false;
+  }
+}
 
 function loadClearImportCustomPassword() {
   try {
@@ -739,6 +1045,20 @@ function resetClearImportPasswordToFactoryDefault() {
     return true;
   } catch {
     return false;
+  }
+}
+
+/** Electron：原生 alert 後鍵盤焦點常留在 OS；拉回視窗才能鍵入（等同使用者 minimize 再開） */
+function restoreElectronWindowKeyboardFocus() {
+  try {
+    window.routePlannerElectron?.focusWindow?.();
+  } catch {
+    /* ignore */
+  }
+  try {
+    window.focus?.();
+  } catch {
+    /* ignore */
   }
 }
 
@@ -785,6 +1105,19 @@ const sidebarSectionLabel = {
   textTransform: 'uppercase',
   color: 'rgba(148, 163, 184, 0.95)',
   marginBottom: '1px',
+};
+
+/** Clear-import 對話框內 password：強制淺色（background/color/caret），避免系統深色或 :root color-scheme 令輸入框黑底黑字「像無法輸入」 */
+const clearImportModalPasswordInputStyle = {
+  width: '100%',
+  padding: '8px 10px',
+  borderRadius: '8px',
+  border: '1px solid #cbd5e1',
+  fontSize: '14px',
+  boxSizing: 'border-box',
+  backgroundColor: '#ffffff',
+  color: '#0f172a',
+  caretColor: '#0f172a',
 };
 
 /** 侧栏一行一物：同名 ACC（不同店）在 React / 勾选里不能只靠 acc（会并成一笔） */
@@ -851,11 +1184,13 @@ function App() {
   const [calendarDayDetailDateStr, setCalendarDayDetailDateStr] = useState(null);
   const [viewMode, setViewMode] = useState('calendar');
   const [importFileName, setImportFileName] = useState(persistedOnMount.importFileName);
-  /** 目前記憶體中的 XLSX workbook（換 sheet 時重複解析）；重新整理後需重新選檔 */
+  /** 目前記憶體中的 XLSX workbook；與 IndexedDB 快取併用，重開程式可不重新選檔即可換工作表 */
   const importWorkbookRef = useRef(null);
   const [importSheetNames, setImportSheetNames] = useState([]);
   const [importSheetIndex, setImportSheetIndex] = useState(0);
   const [sidebarVisitCountFilter, setSidebarVisitCountFilter] = useState('all');
+  /** When true, sidebar list hides customers with zero visits on the calendar in the toolbar Year–Month */
+  const [sidebarMonthScheduledOnly, setSidebarMonthScheduledOnly] = useState(false);
   /** 日历条形「#1/#2/#3」筛选；与侧栏「当月拜访总次数」不同 */
   const [calendarChipRoundFilter, setCalendarChipRoundFilter] = useState('all');
   /** 侧栏店名 / 账号即时过滤（仅影响侧栏列表，与日历工具栏 Find 无关） */
@@ -873,6 +1208,12 @@ function App() {
   const electronHydrationDoneRef = useRef(!hasElectronDataBridge());
   /** 左上角 📍：連點 9 次內將 Clear saved import 自訂密碼還原為出廠 1234（僅移除 localStorage 自訂鍵） */
   const logoPinEasterEggRef = useRef({ count: 0, idleResetId: null });
+  /** ROUTE PRO 最後的 O：連點 9 次開啟隱藏 Settings（公司名稱等） */
+  const logoOSettingsEasterEggRef = useRef({ count: 0, idleResetId: null });
+  const [companyName, setCompanyName] = useState(() => loadStoredCompanyName());
+  const [settingsDialogOpen, setSettingsDialogOpen] = useState(false);
+  const [settingsDraftCompanyName, setSettingsDraftCompanyName] = useState('');
+  const [settingsError, setSettingsError] = useState('');
   const persistDebouncedTimerRef = useRef(null);
   const lastPersistJsonRef = useRef('');
 
@@ -888,7 +1229,8 @@ function App() {
         if (h && Array.isArray(h.customers)) {
           setCustomers(h.customers);
           setSchedules(h.schedules && typeof h.schedules === 'object' && !Array.isArray(h.schedules) ? h.schedules : {});
-          setImportFileName(typeof h.importFileName === 'string' ? h.importFileName : '');
+          const fromDisk = typeof h.importFileName === 'string' ? h.importFileName : '';
+          setImportFileName((prev) => (fromDisk.trim() !== '' ? fromDisk : prev));
         }
       })
       .catch((err) => {
@@ -897,6 +1239,39 @@ function App() {
       .finally(() => {
         if (!cancelled) electronHydrationDoneRef.current = true;
       });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /** 從 IndexedDB 還原上次選取的試算簿（不重跑匯入，只恢復 workbook + sheet 下拉） */
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const row = await loadCachedSpreadsheet();
+      if (!row || cancelled) return;
+      try {
+        let workbook;
+        if (row.kind === 'csv') {
+          let text = String(row.payload);
+          if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+          workbook = XLSX.read(text, { type: 'string', raw: false });
+        } else {
+          workbook = XLSX.read(new Uint8Array(row.payload), { type: 'array' });
+        }
+        const names = Array.isArray(workbook?.SheetNames) ? workbook.SheetNames : [];
+        if (names.length === 0) return;
+        importWorkbookRef.current = workbook;
+        setImportSheetNames(names);
+        const idx = Math.max(0, Math.min(Math.floor(Number(row.sheetIndex)) || 0, names.length - 1));
+        setImportSheetIndex(idx);
+        setImportFileName((prev) =>
+          typeof prev === 'string' && prev.trim() !== '' ? prev : row.fileName || '',
+        );
+      } catch (e) {
+        console.warn('route-planner: hydrate import workbook cache failed', e);
+      }
+    })();
     return () => {
       cancelled = true;
     };
@@ -1182,13 +1557,21 @@ function App() {
     sidebarCategoryFilter,
   ]);
 
-  const sidebarListedCustomers = useMemo(
-    () =>
-      sidebarBaseCustomers.filter((c) =>
-        matchesVisitScheduleFilter(visitCountsMonth[c.acc], sidebarVisitCountFilter),
-      ),
-    [sidebarBaseCustomers, visitCountsMonth, sidebarVisitCountFilter],
-  );
+  const sidebarListedCustomers = useMemo(() => {
+    let list = sidebarBaseCustomers.filter((c) =>
+      matchesVisitScheduleFilter(visitCountsMonth[c.acc], sidebarVisitCountFilter),
+    );
+    if (sidebarMonthScheduledOnly && agent) {
+      list = list.filter((c) => (visitCountsMonth[c.acc] ?? 0) > 0);
+    }
+    return list;
+  }, [
+    sidebarBaseCustomers,
+    visitCountsMonth,
+    sidebarVisitCountFilter,
+    sidebarMonthScheduledOnly,
+    agent,
+  ]);
 
   const sidebarDisplayedCustomers = useMemo(() => {
     const raw = normalizeSidebarSearchPiece(sidebarNameQuery);
@@ -1232,11 +1615,16 @@ function App() {
     setCalendarCategoryFilter('');
     setSyncSidebarCalendarFilters(false);
     setSidebarShowUnassignedOnly(false);
+    setSidebarMonthScheduledOnly(false);
     setUnassignedBrowseModalOpen(false);
     setCalendarDayDetailDateStr(null);
   }, [agent]);
 
-  /** 勾选 Unassigned Show 期间：当前侧栏筛选下已全部上任一日历时，自动取消勾选 */
+  /** Unassigned sidebar entries have no calendar visits → month-only list is meaningless */
+  useEffect(() => {
+    if (sidebarShowUnassignedOnly) setSidebarMonthScheduledOnly(false);
+  }, [sidebarShowUnassignedOnly]);
+
   useEffect(() => {
     if (!sidebarShowUnassignedOnly || !agent) return;
     if (unassignedCustomerCount !== 0) return;
@@ -1297,10 +1685,10 @@ function App() {
     el.indeterminate = some && !all;
   }, [sidebarDisplayedCustomers, sidebarSelectedRowKeys]);
 
-  /** 侧栏：已排总数 → 调色桶（≥6 与第 6 色相同）；角标显示真实总数 */
-  const sidebarColorBucket = (total) => {
-    if (total <= 0) return 0;
-    return Math.min(total, 6);
+  /** 侧栏：toolbar 所选当月排期次数 → 调色桶与角标（与「Visits」筛选、日历月份一致） */
+  const sidebarColorBucket = (monthVisits) => {
+    if (monthVisits <= 0) return 0;
+    return Math.min(monthVisits, 6);
   };
   const monthIsoPad = String(month + 1).padStart(2, '0');
   const monthLabel = `${year}-${MONTH_SHORT[month]}`;
@@ -1376,12 +1764,105 @@ function App() {
     return () => window.removeEventListener('keydown', onKey);
   }, [clearImportDialogOpen, dismissClearImportDialog]);
 
+  /** Electron／某些環境：對話框開啟後焦點未進輸入框，會像「無法輸入密碼」 */
+  useLayoutEffect(() => {
+    if (!clearImportDialogOpen) return;
+    const pickId =
+      clearImportStep === 'unlock'
+        ? 'clear-import-password'
+        : clearImportStep === 'setNewPassword'
+          ? 'clear-import-new-password'
+          : null;
+    if (!pickId) return;
+
+    let cancelled = false;
+    const pullBrowserFocusThenField = () => {
+      if (cancelled) return;
+      restoreElectronWindowKeyboardFocus();
+      /** 主進程 focus 完成後再等兩幀才把 DOM focus 進 input ，避免順序競態 */
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(() => {
+          if (cancelled) return;
+          const el = document.getElementById(pickId);
+          if (el && typeof el.focus === 'function') {
+            try {
+              el.focus({ preventScroll: true });
+            } catch {
+              el.focus();
+            }
+          }
+        });
+      });
+    };
+
+    let timeout40 = 0;
+    let timeout120 = 0;
+    const frameId = window.requestAnimationFrame(() => {
+      pullBrowserFocusThenField();
+      timeout40 = window.setTimeout(pullBrowserFocusThenField, 40);
+      timeout120 = window.setTimeout(pullBrowserFocusThenField, 120);
+    });
+
+    return () => {
+      cancelled = true;
+      window.cancelAnimationFrame(frameId);
+      window.clearTimeout(timeout40);
+      window.clearTimeout(timeout120);
+    };
+  }, [clearImportDialogOpen, clearImportStep]);
+
   useEffect(() => {
     return () => {
-      const id = logoPinEasterEggRef.current.idleResetId;
-      if (id != null) window.clearTimeout(id);
+      const pinId = logoPinEasterEggRef.current.idleResetId;
+      if (pinId != null) window.clearTimeout(pinId);
+      const oId = logoOSettingsEasterEggRef.current.idleResetId;
+      if (oId != null) window.clearTimeout(oId);
     };
   }, []);
+
+  useEffect(() => {
+    const base = 'Route Planner';
+    document.title = companyName.trim() ? `${companyName.trim()} — ${base}` : base;
+  }, [companyName]);
+
+  const dismissSettingsDialog = useCallback(() => {
+    setSettingsDialogOpen(false);
+    setSettingsDraftCompanyName('');
+    setSettingsError('');
+  }, []);
+
+  const handleLogoOSettingsEasterEggClick = useCallback(
+    (e) => {
+      e.stopPropagation();
+      const egg = logoOSettingsEasterEggRef.current;
+      if (egg.idleResetId != null) window.clearTimeout(egg.idleResetId);
+      egg.count += 1;
+      egg.idleResetId = window.setTimeout(() => {
+        egg.count = 0;
+        egg.idleResetId = null;
+      }, 4200);
+      if (egg.count < 9) return;
+      egg.count = 0;
+      if (egg.idleResetId != null) window.clearTimeout(egg.idleResetId);
+      egg.idleResetId = null;
+      setSettingsDraftCompanyName(companyName);
+      setSettingsError('');
+      setSettingsDialogOpen(true);
+    },
+    [companyName],
+  );
+
+  const submitSettingsSave = useCallback(() => {
+    const trimmed = String(settingsDraftCompanyName).trim();
+    if (trimmed.length > 120) {
+      setSettingsError('Company name must be 120 characters or fewer.');
+      return;
+    }
+    if (!saveStoredCompanyName(trimmed)) return;
+    setCompanyName(trimmed);
+    dismissSettingsDialog();
+    restoreElectronWindowKeyboardFocus();
+  }, [settingsDraftCompanyName, dismissSettingsDialog]);
 
   /** Unassigned browse 卡片：套用分区并关掉弹层（侧栏只显示未上色历顾客） */
   const applyUnassignedBrowseAreaToSidebar = useCallback((areaLabel) => {
@@ -1443,7 +1924,7 @@ function App() {
           .flatMap(([dateStr, visits]) =>
             visits.map((v) => ({
               dateStr,
-              weekday: ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][new Date(dateStr).getDay()],
+              weekday: weekdayAbbrevFromIso(dateStr),
               acc: v.acc,
               name: v.name,
               area: customerByAcc[v.acc]?.area ?? '—',
@@ -1542,8 +2023,13 @@ function App() {
         }}
       >
         <div className="summary-print-page-title">
-          Schedule summary · {summaryRangeTitle}
-          {agent ? ` · ${agent}` : ''}
+          {companyName.trim() ? (
+            <span className="app-company-display">{companyName.trim()}</span>
+          ) : null}
+          <span className="summary-print-page-title-meta">
+            Schedule summary · {summaryRangeTitle}
+            {agent ? ` · ${agent}` : ''}
+          </span>
         </div>
         <div className="summary-print-kpi-row" style={{ display: 'flex', gap: '16px', flexWrap: 'wrap' }}>
           {[
@@ -1582,7 +2068,8 @@ function App() {
             <tbody>
               {dateKeys.flatMap((dateStr) =>
                 byDate[dateStr].map((row, idx) => {
-                  const d = row.weekday ?? ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][new Date(dateStr).getDay()];
+                  const d =
+                    row.weekday ?? weekdayAbbrevFromIso(dateStr);
                   const dayNum = Number(dateStr.slice(-2));
                   const showingDate = idx === 0;
                   return (
@@ -1707,6 +2194,7 @@ function App() {
             `${droppedAfterMerge} visit${droppedAfterMerge === 1 ? '' : 's'} had to be dropped because ${droppedAfterMerge === 1 ? 'that account is' : 'those accounts are'} no longer in the spreadsheet.`,
         );
       }
+      void patchCachedSpreadsheetSheetIndex(idx).catch(() => {});
       if (input && typeof input.value === 'string') input.value = '';
       return true;
     } catch (err) {
@@ -1734,14 +2222,30 @@ function App() {
     reader.onload = () => {
       try {
         let workbook;
+        /** @type {{ kind: 'csv'|'binary', payload: string|ArrayBuffer}|null} */
+        let cacheBits = null;
         if (isCsv) {
           let text = String(reader.result ?? '');
           if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+          cacheBits = { kind: 'csv', payload: text };
           workbook = XLSX.read(text, { type: 'string', raw: false });
         } else {
-          workbook = XLSX.read(new Uint8Array(reader.result), { type: 'array' });
+          const raw = reader.result;
+          if (!(raw instanceof ArrayBuffer)) {
+            throw new Error('Expected spreadsheet ArrayBuffer.');
+          }
+          cacheBits = { kind: 'binary', payload: raw.slice(0) };
+          workbook = XLSX.read(new Uint8Array(raw), { type: 'array' });
         }
-        applyImportedWorkbook(workbook, 0, file.name ?? '', input, { clearStoredWorkbookOnDup: true });
+        const ok = applyImportedWorkbook(workbook, 0, file.name ?? '', input, { clearStoredWorkbookOnDup: true });
+        if (ok && cacheBits) {
+          void saveCachedSpreadsheet({
+            fileName: file.name ?? '',
+            kind: cacheBits.kind,
+            payload: cacheBits.payload,
+            sheetIndex: 0,
+          });
+        }
       } catch (err) {
         console.error(err);
         window.alert('Could not read this file. Try .xlsx / .xls / .csv, or re-export from Excel.');
@@ -1756,64 +2260,67 @@ function App() {
   };
 
   const performClearImportDataErase = useCallback(() => {
-    /** 部份電腦 / 瀏覽器政策下 removeItem 會拋錯（無痕、鎖檔）；不可在此 return ，否則密碼對話框永遠不关 */
-    if (typeof localStorage !== 'undefined') {
+    dismissClearImportDialog();
+
+    /** 下一個 macrotask 再做同步 IO（saveSync）與大批 setState ，讓遮罩先有機會卸載繪製，避免「卡住像沒關」 */
+    window.setTimeout(() => {
+      if (typeof localStorage !== 'undefined') {
+        try {
+          localStorage.removeItem(IMPORT_STORE_KEY);
+        } catch (err) {
+          console.warn('route-planner: removeItem IMPORT_STORE_KEY failed', err);
+          window.alert(
+            'Could not delete data from this browser\'s storage (privacy / permissions on this PC).\n\n' +
+              'Continuing to reset on screen and rewrite the Electron data file.',
+          );
+        }
+      }
+
       try {
-        localStorage.removeItem(IMPORT_STORE_KEY);
+        const payloadJson = JSON.stringify(buildPersistPayload([], '', {}));
+        lastPersistJsonRef.current = payloadJson;
+        clearTimeout(persistDebouncedTimerRef.current);
+        persistDebouncedTimerRef.current = null;
+        try {
+          window.routePlannerElectron?.saveSync?.(payloadJson);
+        } catch {
+          /* ignore */
+        }
+        void window.routePlannerElectron?.save?.(payloadJson)?.catch(() => {});
+
+        setCustomers([]);
+        setImportFileName('');
+        importWorkbookRef.current = null;
+        setImportSheetNames([]);
+        setImportSheetIndex(0);
+        setSchedules({});
+        setAgent('');
+        setSidebarVisitCountFilter('all');
+        setCalendarChipRoundFilter('all');
+        setSidebarArea('');
+        setCalendarArea('');
+        setSidebarChannelFilter('');
+        setSidebarCategoryFilter('');
+        setCalendarChannelFilter('');
+        setCalendarCategoryFilter('');
+        setSidebarNameQuery('');
+        setCalendarNameQuery('');
+        setSyncSidebarCalendarFilters(false);
+        setSidebarShowUnassignedOnly(false);
+        setUnassignedBrowseModalOpen(false);
+        setSidebarSelectedRowKeys(new Set());
+        setFocusedDay(null);
+        void clearCachedSpreadsheet();
+        const inp = document.getElementById('route-data-import');
+        if (inp && typeof inp.value === 'string') inp.value = '';
       } catch (err) {
-        console.warn('route-planner: removeItem IMPORT_STORE_KEY failed', err);
+        console.error('route-planner: performClearImportDataErase failed', err);
         window.alert(
-          'Could not delete data from this browser\'s storage (privacy / permissions on this PC).\n\n' +
-            'Continuing to reset on screen and rewrite the Electron data file.',
+          'Clear did not finish completely. Close and reopen Route Planner.\n\n' +
+            'If data is still there, check antivirus/file permissions or try again.',
         );
       }
-    }
-
-    try {
-      const payloadJson = JSON.stringify(buildPersistPayload([], '', {}));
-      lastPersistJsonRef.current = payloadJson;
-      clearTimeout(persistDebouncedTimerRef.current);
-      persistDebouncedTimerRef.current = null;
-      try {
-        window.routePlannerElectron?.saveSync?.(payloadJson);
-      } catch {
-        /* ignore */
-      }
-      void window.routePlannerElectron?.save?.(payloadJson)?.catch(() => {});
-
-      setCustomers([]);
-      setImportFileName('');
-      importWorkbookRef.current = null;
-      setImportSheetNames([]);
-      setImportSheetIndex(0);
-      setSchedules({});
-      setAgent('');
-      setSidebarVisitCountFilter('all');
-      setCalendarChipRoundFilter('all');
-      setSidebarArea('');
-      setCalendarArea('');
-      setSidebarChannelFilter('');
-      setSidebarCategoryFilter('');
-      setCalendarChannelFilter('');
-      setCalendarCategoryFilter('');
-      setSidebarNameQuery('');
-      setCalendarNameQuery('');
-      setSyncSidebarCalendarFilters(false);
-      setSidebarShowUnassignedOnly(false);
-      setUnassignedBrowseModalOpen(false);
-      setSidebarSelectedRowKeys(new Set());
-      setFocusedDay(null);
-      const inp = document.getElementById('route-data-import');
-      if (inp && typeof inp.value === 'string') inp.value = '';
-    } catch (err) {
-      console.error('route-planner: performClearImportDataErase failed', err);
-      window.alert(
-        'Clear did not finish completely. Close and reopen Route Planner.\n\n' +
-          'If data is still there, check antivirus/file permissions or try again.',
-      );
-    } finally {
-      dismissClearImportDialog();
-    }
+    }, 0);
   }, [dismissClearImportDialog]);
 
   const submitClearImportUnlockStep = () => {
@@ -1880,6 +2387,14 @@ function App() {
     }
     if (payloads.length === 0) return;
 
+    const placementDate = advanceIsoPastSundaysAndPublicHolidays(dateStr);
+    if (placementDate !== dateStr) {
+      restoreElectronWindowKeyboardFocus();
+      window.alert(
+        `That day is a Sunday or a public holiday highlighted on this calendar (${dateStr}). Visits were placed on ${placementDate} instead.`,
+      );
+    }
+
     const isCalendarMove = payloads.length === 1 && Boolean(payloads[0].oldDate);
 
     const isSidebarBatch = payloads.length > 1 && payloads.every((p) => !p.oldDate);
@@ -1915,7 +2430,7 @@ function App() {
           else delete agentSched[data.oldDate];
         }
 
-        const daySched = [...(agentSched[dateStr] || [])];
+        const daySched = [...(agentSched[placementDate] || [])];
         if (daySched.some((c) => c.acc === data.acc)) return prev;
 
         let visitRound;
@@ -1925,17 +2440,17 @@ function App() {
           visitRound = countAcc() + 1;
         }
 
-        agentSched[dateStr] = [...daySched, { acc: data.acc, name: data.name, visitRound }];
+        agentSched[placementDate] = [...daySched, { acc: data.acc, name: data.name, visitRound }];
         return { ...prev, [agent]: agentSched };
       }
 
       let changed = false;
       for (const data of payloads) {
         if (data.oldDate) continue;
-        const daySched = [...(agentSched[dateStr] || [])];
+        const daySched = [...(agentSched[placementDate] || [])];
         if (daySched.some((c) => c.acc === data.acc)) continue;
         const visitRound = countAccFor(data.acc) + 1;
-        agentSched[dateStr] = [...daySched, { acc: data.acc, name: data.name, visitRound }];
+        agentSched[placementDate] = [...daySched, { acc: data.acc, name: data.name, visitRound }];
         changed = true;
       }
       if (!changed) return prev;
@@ -1958,6 +2473,92 @@ function App() {
       return { ...prev, [agent]: agentSched };
     });
   };
+
+  /** Copy this agent's calendar visits in the viewed month onto the next month's same calendar dates (merge; skip dup acc same day). */
+  const handleCopyMonthVisitsToNextMonth = useCallback(() => {
+    if (!agent) {
+      window.alert('Please select a sales agent first.');
+      return;
+    }
+    const nextMonthIdx = month === 11 ? 0 : month + 1;
+    const nextYearVal = month === 11 ? year + 1 : year;
+    const nextMonthLabel = `${nextYearVal}-${MONTH_SHORT[nextMonthIdx]}`;
+    const curMonthLabel = `${year}-${MONTH_SHORT[month]}`;
+    const ok =
+      typeof window !== 'undefined' &&
+      window.confirm(
+        `Copy ${curMonthLabel} calendar visits for the current agent to matching dates in ${nextMonthLabel}?\n\n` +
+          'If a target day is a Sunday or a yellow public holiday on this calendar, visits are bumped forward day by day to the next open day.\n\n' +
+          'If a customer is already scheduled on the target day, that visit will be skipped (no duplicates).',
+      );
+    if (!ok) return;
+
+    let dup = /** @type {ReturnType<typeof duplicateAgentMonthVisitsOneMonthAhead>|null} */ (null);
+    setSchedules((prev) => {
+      dup = duplicateAgentMonthVisitsOneMonthAhead(prev, agent, year, month);
+      return dup.changed ? dup.next : prev;
+    });
+    if (!dup) return;
+
+    if (!dup.changed) {
+      if (dup.added === 0 && dup.skippedDup === 0) {
+        window.alert('No calendar visits in this month to copy.');
+      } else if (dup.added === 0 && dup.skippedDup > 0) {
+        window.alert(
+          `Nothing to add — ${dup.skippedDup} visit(s) skipped because that customer is already on the matching day next month.`,
+        );
+      }
+      restoreElectronWindowKeyboardFocus();
+      return;
+    }
+
+    restoreElectronWindowKeyboardFocus();
+
+    let doneMsg = `Copied ${dup.added} visit(s) to next month.`;
+    if (dup.skippedDup > 0) doneMsg += ` (${dup.skippedDup} skipped — customer already on that day.)`;
+    if (dup.sourceDatesShiftedFromBlockedDays > 0) {
+      doneMsg += `\n\n${dup.sourceDatesShiftedFromBlockedDays} copied source day(s) landed on Sundays or holidays and were shifted to the next open day(s).`;
+    }
+    if (dup.daysSpilledPastTargetMonth > 0) {
+      doneMsg += `\n\n${dup.daysSpilledPastTargetMonth} group(s) moved past the end of the target month—open Year/Month and check adjacent month.`;
+    }
+    window.alert(doneMsg);
+
+    setYear(nextYearVal);
+    setMonth(nextMonthIdx);
+    setFocusedDay(null);
+  }, [agent, month, year]);
+
+  /** One-click fix for old data / mistakes: Sundays in toolbar month → following Monday */
+  const handleMoveSundayVisitsToMondayCurrentMonth = useCallback(() => {
+    if (!agent) {
+      window.alert('Please select a sales agent first.');
+      return;
+    }
+    const curMonthLabel = `${year}-${MONTH_SHORT[month]}`;
+    const ok =
+      typeof window !== 'undefined' &&
+      window.confirm(
+        `Move all visits scheduled on Sundays in ${curMonthLabel} for ${agent} to the following Monday?\n\n` +
+          'If Monday already lists the same customer, that duplicate on Sunday will be cleared only.',
+      );
+    if (!ok) return;
+
+    let out = /** @type {ReturnType<typeof moveSundayVisitsToMondayForAgentMonth>|null} */ (null);
+    setSchedules((prev) => {
+      out = moveSundayVisitsToMondayForAgentMonth(prev, agent, year, month);
+      return out.changed ? out.next : prev;
+    });
+    if (!out) return;
+    restoreElectronWindowKeyboardFocus();
+    if (!out.changed) {
+      window.alert('No visits on Sundays in this month for this agent.');
+      return;
+    }
+    let msg = `Moved ${out.movedVisits} visit(s) off ${out.sundayDatesTouched} Sunday date(s).`;
+    if (out.skippedDup > 0) msg += ` (${out.skippedDup} were duplicate accounts already on Monday and were removed.)`;
+    window.alert(msg);
+  }, [agent, year, month]);
 
   const renderCalendar = () => (
     <div className="cal-calendar-body" style={{ width: '100%', minWidth: 0, flex: '1 1 auto', minHeight: 0 }}>
@@ -2062,11 +2663,24 @@ function App() {
           }
           .summary-print-page-title {
             display: block !important;
-            font-size: 14pt !important;
-            font-weight: 700 !important;
-            color: #0f172a !important;
             margin: 0 0 14px 0 !important;
             padding: 0 !important;
+          }
+          .summary-print-page-title .app-company-display {
+            display: block !important;
+            font-size: 22pt !important;
+            margin-bottom: 6px !important;
+            color: #0f172a !important;
+            -webkit-text-fill-color: #0f172a !important;
+            background: none !important;
+          }
+          .summary-print-page-title-meta {
+            display: block !important;
+            font-size: 11pt !important;
+            font-weight: 600 !important;
+            color: #475569 !important;
+            letter-spacing: 0.04em !important;
+            text-transform: uppercase !important;
           }
           .summary-print-table-host {
             overflow: visible !important;
@@ -2164,6 +2778,109 @@ function App() {
           scrollbar-width: thin;
           scrollbar-color: rgba(100, 116, 139, 0.5) rgba(241, 245, 249, 0.95);
         }
+        .app-company-display {
+          font-family: 'DM Serif Display', Georgia, 'Times New Roman', serif;
+          font-weight: 400;
+          font-style: normal;
+          letter-spacing: 0.012em;
+          font-feature-settings: 'kern' 1, 'liga' 1;
+          text-rendering: optimizeLegibility;
+          -webkit-font-smoothing: antialiased;
+          -moz-osx-font-smoothing: grayscale;
+        }
+        .main-toolbar-company-wrap {
+          display: flex;
+          flex-direction: column;
+          justify-content: center;
+          gap: 3px;
+          padding: 4px 0 4px 16px;
+          margin-left: 6px;
+          border-left: 2px solid transparent;
+          border-image: linear-gradient(180deg, #bae6fd 0%, #2563eb 45%, #7c3aed 100%) 1;
+          min-width: 0;
+          max-width: min(440px, 44vw);
+        }
+        .main-toolbar-company-label {
+          font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+          font-size: 8px;
+          font-weight: 800;
+          letter-spacing: 0.24em;
+          text-transform: uppercase;
+          line-height: 1;
+          margin: 0;
+          background: linear-gradient(90deg, #64748b 0%, #2563eb 55%, #7c3aed 100%);
+          -webkit-background-clip: text;
+          background-clip: text;
+          -webkit-text-fill-color: transparent;
+          color: transparent;
+        }
+        .main-toolbar-company-name {
+          margin: 0;
+          font-size: clamp(1.32rem, 2.6vw, 1.92rem);
+          line-height: 1.08;
+          font-weight: 400;
+          background: linear-gradient(
+            165deg,
+            #38bdf8 0%,
+            #2563eb 22%,
+            #6366f1 48%,
+            #7c3aed 68%,
+            #1d4ed8 88%,
+            #0ea5e9 100%
+          );
+          -webkit-background-clip: text;
+          background-clip: text;
+          -webkit-text-fill-color: transparent;
+          color: transparent;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+          /* Light 3D — fewer, softer layers */
+          filter:
+            drop-shadow(0 1px 0 rgba(255, 255, 255, 0.75))
+            drop-shadow(0 2px 0 rgba(147, 197, 253, 0.45))
+            drop-shadow(0 3px 0 rgba(59, 130, 246, 0.35))
+            drop-shadow(0 4px 6px rgba(15, 23, 42, 0.12));
+        }
+        .app-company-display--sidebar {
+          display: block;
+          font-size: 0.82rem;
+          line-height: 1.2;
+          text-align: center;
+          margin: 0 0 2px;
+          padding: 0 4px;
+          background: linear-gradient(180deg, #f8fafc 0%, #cbd5e1 100%);
+          -webkit-background-clip: text;
+          background-clip: text;
+          -webkit-text-fill-color: transparent;
+          color: transparent;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .app-company-display--on-dark {
+          font-size: 1.05rem;
+          line-height: 1.15;
+          background: linear-gradient(105deg, #ffffff 0%, #e2e8f0 55%, #94a3b8 100%);
+          -webkit-background-clip: text;
+          background-clip: text;
+          -webkit-text-fill-color: transparent;
+          color: transparent;
+        }
+        .schedule-strip-agent-row {
+          display: inline-flex;
+          align-items: baseline;
+          flex-wrap: wrap;
+          gap: 0 10px;
+          min-width: 0;
+        }
+        .schedule-strip-agent-meta {
+          font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+          font-size: 13px;
+          font-weight: 700;
+          letter-spacing: 0.04em;
+          color: rgba(255, 255, 255, 0.92);
+        }
       `}</style>
       
       {/* Sidebar: top controls fixed, customer list fills remaining viewport and scrolls */}
@@ -2188,6 +2905,7 @@ function App() {
               const hadCustom = loadClearImportCustomPassword() != null;
               if (!resetClearImportPasswordToFactoryDefault()) {
                 window.alert('Could not reset password (storage blocked).');
+                restoreElectronWindowKeyboardFocus();
                 return;
               }
               window.alert(
@@ -2195,15 +2913,31 @@ function App() {
                   ? 'Hidden reset OK: Clear saved import now uses factory password 1234 again.'
                   : 'No custom clear password was saved; unlock already uses factory 1234.',
               );
+              restoreElectronWindowKeyboardFocus();
             }}
             title=""
             style={{ cursor: 'inherit', userSelect: 'none', display: 'inline-block', marginRight: '1px' }}
           >
             📍
           </span>
-          ROUTE PRO
+          ROUTE PR
+          <span
+            aria-hidden
+            onClick={handleLogoOSettingsEasterEggClick}
+            title=""
+            style={{ cursor: 'inherit', userSelect: 'none' }}
+          >
+            O
+          </span>
         </h2>
-        <p style={{ textAlign: 'center', fontSize: '7px', color: 'rgba(148, 163, 184, 0.85)', margin: '1px 0 3px', lineHeight: 1.15 }}>{'Import · schedule visits'}</p>
+        {companyName.trim() ? (
+          <p className="app-company-display app-company-display--sidebar" title={companyName.trim()}>
+            {companyName.trim()}
+          </p>
+        ) : null}
+        <p style={{ textAlign: 'center', fontSize: '7px', color: 'rgba(148, 163, 184, 0.85)', margin: companyName.trim() ? '0 0 3px' : '1px 0 3px', lineHeight: 1.15 }}>
+          {`Import · schedule visits · v${packageJson.version}`}
+        </p>
 
         <div style={{ marginBottom: '4px' }}>
           <label style={sidebarSectionLabel}>1. Data import</label>
@@ -2725,10 +3459,10 @@ function App() {
               </div>
               {sidebarDisplayedCustomers.map((c, idx) => {
                 const rk = sidebarRowListKey(c, idx);
-                const total = visitCountsTotal[c.acc] ?? 0;
-                const bucket = sidebarColorBucket(total);
-                const pal = paletteForTotalVisits(total);
-                const badge = total > 0 ? String(total) : null;
+                const monthVisits = visitCountsMonth[c.acc] ?? 0;
+                const bucket = sidebarColorBucket(monthVisits);
+                const pal = paletteForVisitCountDisplay(monthVisits);
+                const badge = monthVisits > 0 ? String(monthVisits) : null;
                 const isSelected = sidebarSelectedRowKeys.has(rk);
                 const bulkOnList = sidebarDisplayedCustomers.filter((row, i) =>
                   sidebarSelectedRowKeys.has(sidebarRowListKey(row, i)),
@@ -2782,7 +3516,13 @@ function App() {
                     >
                       {badge != null && (
                         <span
-                          title={total >= 6 ? `已排 ${total} 次（颜色与第 6 档相同）` : `已排 ${total} 次`}
+                          title={
+                            monthVisits >= 6
+                              ? `Scheduled ${monthVisits} time(s) in ${monthLabel} (bucket 6 color)`
+                              : monthVisits > 0
+                                ? `Scheduled ${monthVisits} time(s) in ${monthLabel}`
+                                : ''
+                          }
                           style={{
                             minWidth: '16px',
                             height: '16px',
@@ -2803,7 +3543,10 @@ function App() {
                       )}
                     </div>
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: '7px', color: bucket > 0 ? 'rgba(248, 250, 252, 0.85)' : '#60a5fa' }}>{c.acc}{total > 0 ? ` · ${total}×` : ''}</div>
+                      <div style={{ fontSize: '7px', color: bucket > 0 ? 'rgba(248, 250, 252, 0.85)' : '#60a5fa' }}>
+                        {c.acc}
+                        {monthVisits > 0 ? ` · ${monthVisits}× this month` : ''}
+                      </div>
                       <div style={{ fontSize: '9px', fontWeight: 700, color: '#f8fafc', lineHeight: 1.18 }}>{c.name}</div>
                     </div>
                     <label
@@ -2841,10 +3584,18 @@ function App() {
 
       {/* Main Panel - 必须 flex:1 撑满剩余空间 */}
       <main className="main-column" style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, minWidth: 0, background: '#f1f5f9', height: '100%' }}>
-        <div className="no-print" style={{ padding: '15px 25px', display: 'flex', justifyContent: 'space-between', background: 'white', borderBottom: '1px solid #e2e8f0' }}>
-          <div style={{ display: 'flex', gap: '10px' }}>
-            <button onClick={()=>setViewMode('calendar')} style={{ padding: '8px 15px', borderRadius: '5px', cursor: 'pointer', background: viewMode==='calendar'?'#1e293b':'white', color: viewMode==='calendar'?'white':'#1e293b' }}>Calendar</button>
-            <button onClick={()=>setViewMode('summary')} style={{ padding: '8px 15px', borderRadius: '5px', cursor: 'pointer', background: viewMode==='summary'?'#1e293b':'white', color: viewMode==='summary'?'white':'#1e293b' }}>Summary</button>
+        <div className="no-print" style={{ padding: '15px 25px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px', flexWrap: 'wrap', background: 'white', borderBottom: '1px solid #e2e8f0' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0', flexWrap: 'wrap', minWidth: 0, flex: '1 1 auto' }}>
+            <div style={{ display: 'flex', gap: '10px', flexShrink: 0 }}>
+              <button onClick={()=>setViewMode('calendar')} style={{ padding: '8px 15px', borderRadius: '5px', cursor: 'pointer', background: viewMode==='calendar'?'#1e293b':'white', color: viewMode==='calendar'?'white':'#1e293b', border: viewMode==='calendar'?'none':'1px solid #e2e8f0' }}>Calendar</button>
+              <button onClick={()=>setViewMode('summary')} style={{ padding: '8px 15px', borderRadius: '5px', cursor: 'pointer', background: viewMode==='summary'?'#1e293b':'white', color: viewMode==='summary'?'white':'#1e293b', border: viewMode==='summary'?'none':'1px solid #e2e8f0' }}>Summary</button>
+            </div>
+            {companyName.trim() ? (
+              <div className="main-toolbar-company-wrap" title={companyName.trim()}>
+                <p className="main-toolbar-company-label">Company</p>
+                <p className="app-company-display main-toolbar-company-name">{companyName.trim()}</p>
+              </div>
+            ) : null}
           </div>
           <button
             type="button"
@@ -2858,7 +3609,17 @@ function App() {
 
         <div className="main-scroll-region" style={{ flex: 1, minHeight: 0, minWidth: 0, overflowY: 'auto', overflowX: 'hidden', padding: '14px 16px', display: 'flex', flexDirection: 'column' }}>
           <div className="schedule-strip-print" style={{ flexShrink: 0, background: '#1e293b', color: 'white', padding: '15px 25px', borderRadius: '12px 12px 0 0', fontWeight: 'bold', display:'flex', justifyContent:'space-between', alignItems: 'center', gap: '12px', flexWrap: 'wrap', width: '100%', boxSizing: 'border-box' }}>
-            <span style={{ minWidth: 0 }}>AGENT: {agent || 'NOT SELECTED'}</span>
+            <span className="schedule-strip-agent-row" style={{ minWidth: 0 }}>
+              {companyName.trim() ? (
+                <>
+                  <span className="app-company-display app-company-display--on-dark" title={companyName.trim()}>
+                    {companyName.trim()}
+                  </span>
+                  <span style={{ opacity: 0.35, fontWeight: 300 }} aria-hidden>|</span>
+                </>
+              ) : null}
+              <span className="schedule-strip-agent-meta">AGENT: {agent || 'NOT SELECTED'}</span>
+            </span>
             <div className="no-print" style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
               <label style={{ fontSize: '11px', fontWeight: 600, opacity: 0.75, textTransform: 'uppercase', marginRight: '2px' }}>Year</label>
               <select
@@ -2882,6 +3643,50 @@ function App() {
                   <option key={label} value={m}>{label}</option>
                 ))}
               </select>
+              <button
+                type="button"
+                className="no-print"
+                onClick={handleCopyMonthVisitsToNextMonth}
+                disabled={!agent}
+                title="Copies visits to same day next month. Sundays and yellow-calendar public holidays bump forward day-by-day until an open date. Duplicate customers same day skipped."
+                style={{
+                  marginLeft: '6px',
+                  padding: '6px 10px',
+                  borderRadius: '6px',
+                  border: '1px solid rgba(255,255,255,0.35)',
+                  background: agent ? 'rgba(255,255,255,0.14)' : 'rgba(255,255,255,0.06)',
+                  color: 'white',
+                  fontSize: '11px',
+                  fontWeight: 700,
+                  cursor: agent ? 'pointer' : 'not-allowed',
+                  opacity: agent ? 1 : 0.45,
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                Copy → next month
+              </button>
+              <button
+                type="button"
+                className="no-print"
+                onClick={handleMoveSundayVisitsToMondayCurrentMonth}
+                disabled={!agent}
+                title="Moves every visit sitting on Sundays in the selected Year/Month to the following Monday. Use this once to repair older copies—or leave new drops alone; Sundays now redirect drops to Monday automatically."
+                style={{
+                  marginLeft: '6px',
+                  padding: '6px 10px',
+                  borderRadius: '6px',
+                  border: '1px solid rgba(255,255,255,0.35)',
+                  background: agent ? 'rgba(255,255,255,0.14)' : 'rgba(255,255,255,0.06)',
+                  color: 'white',
+                  fontSize: '11px',
+                  fontWeight: 700,
+                  cursor: agent ? 'pointer' : 'not-allowed',
+                  opacity: agent ? 1 : 0.45,
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                Sundays → Mon
+              </button>
               {viewMode === 'calendar' && (
                 <>
                   <label style={{ fontSize: '11px', fontWeight: 600, opacity: 0.75, textTransform: 'uppercase', marginLeft: '4px', marginRight: '2px' }}>Day</label>
@@ -3567,6 +4372,7 @@ function App() {
         >
           <div
             role="presentation"
+            onMouseDown={(e) => e.stopPropagation()}
             onClick={(e) => e.stopPropagation()}
             style={{
               background: '#ffffff',
@@ -3576,6 +4382,7 @@ function App() {
               overflow: 'hidden',
               boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.35)',
               border: '1px solid #e2e8f0',
+              colorScheme: 'light',
             }}
           >
             <div style={{ padding: '14px 16px 10px', borderBottom: '1px solid #e2e8f0' }}>
@@ -3615,18 +4422,16 @@ function App() {
                     id="clear-import-password"
                     type="password"
                     autoComplete="off"
+                    spellCheck={false}
+                    autoCapitalize="off"
+                    autoCorrect="off"
                     value={clearImportPassword}
                     onChange={(e) => {
                       setClearImportPassword(e.target.value);
                       setClearImportError('');
                     }}
                     style={{
-                      width: '100%',
-                      padding: '8px 10px',
-                      borderRadius: '8px',
-                      border: '1px solid #cbd5e1',
-                      fontSize: '14px',
-                      boxSizing: 'border-box',
+                      ...clearImportModalPasswordInputStyle,
                     }}
                   />
                 </>
@@ -3644,18 +4449,16 @@ function App() {
                     id="clear-import-new-password"
                     type="password"
                     autoComplete="new-password"
+                    spellCheck={false}
+                    autoCapitalize="off"
+                    autoCorrect="off"
                     value={clearImportNewPassword}
                     onChange={(e) => {
                       setClearImportNewPassword(e.target.value);
                       setClearImportError('');
                     }}
                     style={{
-                      width: '100%',
-                      padding: '8px 10px',
-                      borderRadius: '8px',
-                      border: '1px solid #cbd5e1',
-                      fontSize: '14px',
-                      boxSizing: 'border-box',
+                      ...clearImportModalPasswordInputStyle,
                     }}
                   />
                   <label style={{ fontSize: '11px', fontWeight: 700, color: '#334155' }} htmlFor="clear-import-new-password-confirm">
@@ -3665,18 +4468,16 @@ function App() {
                     id="clear-import-new-password-confirm"
                     type="password"
                     autoComplete="new-password"
+                    spellCheck={false}
+                    autoCapitalize="off"
+                    autoCorrect="off"
                     value={clearImportNewPasswordConfirm}
                     onChange={(e) => {
                       setClearImportNewPasswordConfirm(e.target.value);
                       setClearImportError('');
                     }}
                     style={{
-                      width: '100%',
-                      padding: '8px 10px',
-                      borderRadius: '8px',
-                      border: '1px solid #cbd5e1',
-                      fontSize: '14px',
-                      boxSizing: 'border-box',
+                      ...clearImportModalPasswordInputStyle,
                     }}
                   />
                 </>
@@ -3745,6 +4546,113 @@ function App() {
                   }}
                 >
                   {clearImportStep === 'unlock' ? 'Continue' : 'Erase saved data'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {settingsDialogOpen ? (
+        <div
+          className="no-print"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="settings-dialog-title"
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 10055,
+            background: 'rgba(15, 23, 42, 0.55)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '16px',
+            boxSizing: 'border-box',
+          }}
+          onClick={dismissSettingsDialog}
+        >
+          <div
+            role="presentation"
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: '#ffffff',
+              borderRadius: '12px',
+              maxWidth: '420px',
+              width: '100%',
+              overflow: 'hidden',
+              boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.35)',
+              border: '1px solid #e2e8f0',
+              colorScheme: 'light',
+            }}
+          >
+            <div style={{ padding: '14px 16px 10px', borderBottom: '1px solid #e2e8f0' }}>
+              <h2 id="settings-dialog-title" style={{ margin: 0, fontSize: '15px', fontWeight: 800, color: '#0f172a' }}>
+                Settings
+              </h2>
+              <p style={{ margin: '8px 0 0', fontSize: '12px', color: '#64748b', lineHeight: 1.45 }}>
+                Company name appears in the sidebar, calendar bar, Summary / PDF, and window title. Leave blank to hide.
+              </p>
+            </div>
+            <div style={{ padding: '12px 16px 14px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+              <label style={{ fontSize: '11px', fontWeight: 700, color: '#334155' }} htmlFor="settings-company-name">
+                Company name
+              </label>
+              <input
+                id="settings-company-name"
+                type="text"
+                autoComplete="organization"
+                spellCheck={false}
+                autoCapitalize="words"
+                maxLength={120}
+                value={settingsDraftCompanyName}
+                onChange={(e) => {
+                  setSettingsDraftCompanyName(e.target.value);
+                  setSettingsError('');
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') submitSettingsSave();
+                }}
+                placeholder="e.g. ABC Trading Sdn Bhd"
+                style={{ ...clearImportModalPasswordInputStyle }}
+              />
+              {settingsError ? (
+                <div style={{ fontSize: '12px', fontWeight: 600, color: '#b91c1c' }}>{settingsError}</div>
+              ) : null}
+              <div style={{ display: 'flex', gap: '8px', marginTop: '4px' }}>
+                <button
+                  type="button"
+                  onClick={dismissSettingsDialog}
+                  style={{
+                    flex: 1,
+                    padding: '9px 12px',
+                    borderRadius: '8px',
+                    border: '1px solid #cbd5e1',
+                    background: '#fff',
+                    color: '#0f172a',
+                    fontSize: '13px',
+                    fontWeight: 700,
+                    cursor: 'pointer',
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={submitSettingsSave}
+                  style={{
+                    flex: 1,
+                    padding: '9px 12px',
+                    borderRadius: '8px',
+                    border: '1px solid #2563eb',
+                    background: '#2563eb',
+                    color: '#fff',
+                    fontSize: '13px',
+                    fontWeight: 700,
+                    cursor: 'pointer',
+                  }}
+                >
+                  Save
                 </button>
               </div>
             </div>
