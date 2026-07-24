@@ -2,6 +2,7 @@ import { useState, useMemo, useEffect, useRef, useLayoutEffect, useCallback } fr
 import { Upload } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import packageJson from '../package.json';
+import routeProLogo from './assets/hero.png';
 import {
   saveCachedSpreadsheet,
   loadCachedSpreadsheet,
@@ -561,6 +562,26 @@ function monthWeekSlots(firstDay, totalDays) {
   return weeks;
 }
 
+/** Sunday (local) ISO yyyy-mm-dd for the week containing dateStr — used for print week pages */
+function sundayIsoOfContainingWeek(dateStr) {
+  const parts = String(dateStr).split('-').map(Number);
+  if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n))) return dateStr;
+  const [y, m, d] = parts;
+  const dt = new Date(y, m - 1, d);
+  if (dt.getFullYear() !== y || dt.getMonth() !== m - 1 || dt.getDate() !== d) return dateStr;
+  dt.setDate(dt.getDate() - dt.getDay());
+  return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`;
+}
+
+/** Print label for a week row’s in-month day span, e.g. "5–11" or "28–31" */
+function weekInMonthDaySpanLabel(weekCells) {
+  const days = weekCells.filter((s) => s.kind === 'day').map((s) => s.dayNum);
+  if (days.length === 0) return '';
+  const lo = Math.min(...days);
+  const hi = Math.max(...days);
+  return lo === hi ? String(lo) : `${lo}–${hi}`;
+}
+
 /** 一周内所有拜访条共用同一字号（整排行同步缩放）；宽度取自该行任一条的文字区（各列等宽） */
 function CalWeekRow({
   weekCells,
@@ -574,9 +595,13 @@ function CalWeekRow({
   calendarFilterAcc,
   calendarChipRoundFilter,
   onDayDoubleClick,
+  monthLabel,
+  companyName,
+  isLastWeek,
 }) {
   const rowHostRef = useRef(null);
   const [rowFontPx, setRowFontPx] = useState(CAL_CHIP_FONT_MAX);
+  const daySpan = weekInMonthDaySpanLabel(weekCells);
 
   const enriched = useMemo(
     () =>
@@ -693,67 +718,97 @@ function CalWeekRow({
   }, [rowTaskCount, rowTaskKey, enriched]);
 
   return (
-    <div ref={rowHostRef} style={{ display: 'contents' }}>
-      {enriched.map((cell) => {
-        if (cell.kind === 'padding') {
+    <div
+      className={`cal-week-block${isLastWeek ? ' cal-week-block--last' : ''}`}
+      style={{ width: '100%', boxSizing: 'border-box' }}
+    >
+      <div className="cal-week-print-banner">
+        <span>
+          {companyName?.trim() ? `${companyName.trim()} · ` : ''}
+          {agent || 'NOT SELECTED'}
+          {' · '}
+          {monthLabel}
+          {daySpan ? ` · days ${daySpan}` : ''}
+        </span>
+        <span>One week / page</span>
+      </div>
+      <div className="cal-week-print-weekdays">
+        {WEEKDAY_ABBREV_SUN0.map((label) => (
+          <div key={label}>{label}</div>
+        ))}
+      </div>
+      <div
+        ref={rowHostRef}
+        className="cal-week-row"
+        style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(7, 1fr)',
+          alignItems: 'stretch',
+          width: '100%',
+          boxSizing: 'border-box',
+        }}
+      >
+        {enriched.map((cell) => {
+          if (cell.kind === 'padding') {
+            return (
+              <div
+                key={cell.key}
+                className="cal-pad-cell"
+                style={{
+                  background: '#f8fafc',
+                  border: '1px solid #e2e8f0',
+                  minHeight: '144px',
+                  boxSizing: 'border-box',
+                }}
+              />
+            );
+          }
+          const { dayNum, dateStr, isSun, tasks } = cell;
+          const isFocused = highlightedDayNum != null && highlightedDayNum === dayNum;
+          const holidayName = sabahHolidayNameForCalendarDate(dateStr);
+          const cellTitle =
+            holidayName != null
+              ? `${holidayName} (public holiday) · Double-click this day for the visit list`
+              : isSun
+                ? 'Sunday · often a weekly rest day or non-working day · Double-click for the visit list'
+                : 'Double-click this day for full customer names and accounts';
           return (
             <div
               key={cell.key}
-              className="cal-pad-cell"
-              style={{
-                background: '#f8fafc',
-                border: '1px solid #e2e8f0',
-                minHeight: '144px',
-                boxSizing: 'border-box',
+              className="cal-day-cell"
+              data-cal-focus-day={dayNum}
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={(e) => {
+                e.preventDefault();
+                const raw = e.dataTransfer.getData('text') || e.dataTransfer.getData('text/plain');
+                dropOnDate(dateStr, raw);
               }}
-            />
+              onDoubleClick={() => onDayDoubleClick?.(dateStr)}
+              title={cellTitle}
+              style={{
+                minHeight: '144px',
+                display: 'flex',
+                flexDirection: 'column',
+                border: '1px solid #cbd5e1',
+                padding: '10px',
+                background: holidayName ? '#fef08a' : (isSun ? '#ffe4e6' : 'white'),
+                position: 'relative',
+                boxSizing: 'border-box',
+                boxShadow: isFocused ? 'inset 0 0 0 2px #2563eb' : undefined,
+                zIndex: isFocused ? 1 : 0,
+              }}
+            >
+              <b style={{ flexShrink: 0, color: isSun ? '#e11d48' : '#1e293b', fontSize: '15px', fontWeight: 800 }}>{dayNum}</b>
+              <CalDayTasksColumn
+                dateStr={dateStr}
+                tasks={tasks}
+                removeScheduledVisit={removeScheduledVisit}
+                fontPx={rowFontPx}
+              />
+            </div>
           );
-        }
-        const { dayNum, dateStr, isSun, tasks } = cell;
-        const isFocused = highlightedDayNum != null && highlightedDayNum === dayNum;
-        const holidayName = sabahHolidayNameForCalendarDate(dateStr);
-        const cellTitle =
-          holidayName != null
-            ? `${holidayName} (public holiday) · Double-click this day for the visit list`
-            : isSun
-              ? 'Sunday · often a weekly rest day or non-working day · Double-click for the visit list'
-              : 'Double-click this day for full customer names and accounts';
-        return (
-          <div
-            key={cell.key}
-            className="cal-day-cell"
-            data-cal-focus-day={dayNum}
-            onDragOver={(e) => e.preventDefault()}
-            onDrop={(e) => {
-              e.preventDefault();
-              const raw = e.dataTransfer.getData('text') || e.dataTransfer.getData('text/plain');
-              dropOnDate(dateStr, raw);
-            }}
-            onDoubleClick={() => onDayDoubleClick?.(dateStr)}
-            title={cellTitle}
-            style={{
-              minHeight: '144px',
-              display: 'flex',
-              flexDirection: 'column',
-              border: '1px solid #cbd5e1',
-              padding: '10px',
-              background: holidayName ? '#fef08a' : (isSun ? '#ffe4e6' : 'white'),
-              position: 'relative',
-              boxSizing: 'border-box',
-              boxShadow: isFocused ? 'inset 0 0 0 2px #2563eb' : undefined,
-              zIndex: isFocused ? 1 : 0,
-            }}
-          >
-            <b style={{ flexShrink: 0, color: isSun ? '#e11d48' : '#1e293b', fontSize: '15px', fontWeight: 800 }}>{dayNum}</b>
-            <CalDayTasksColumn
-              dateStr={dateStr}
-              tasks={tasks}
-              removeScheduledVisit={removeScheduledVisit}
-              fontPx={rowFontPx}
-            />
-          </div>
-        );
-      })}
+        })}
+      </div>
     </div>
   );
 }
@@ -2008,6 +2063,40 @@ function App() {
     const summaryRangeTitle =
       from === 1 && to === daysInMonth ? monthLabel : `${monthLabel}, days ${from}–${to}`;
 
+    /** Group scheduled days into Sun–Sat weeks for one-week-per-page print */
+    const weekBuckets = [];
+    const weekIndexBySunday = new Map();
+    dateKeys.forEach((dateStr) => {
+      const sun = sundayIsoOfContainingWeek(dateStr);
+      let idx = weekIndexBySunday.get(sun);
+      if (idx == null) {
+        idx = weekBuckets.length;
+        weekIndexBySunday.set(sun, idx);
+        weekBuckets.push({ sundayIso: sun, dateKeys: [] });
+      }
+      weekBuckets[idx].dateKeys.push(dateStr);
+    });
+
+    const renderVisitRows = (keys) =>
+      keys.flatMap((dateStr) =>
+        byDate[dateStr].map((row, idx) => {
+          const d = row.weekday ?? weekdayAbbrevFromIso(dateStr);
+          const dayNum = Number(dateStr.slice(-2));
+          const showingDate = idx === 0;
+          return (
+            <tr key={`${dateStr}-${row.acc}-${idx}`} style={{ background: 'white' }}>
+              <td style={{ ...cell, color: '#0f172a', fontWeight: showingDate ? 600 : 400, verticalAlign: 'top', whiteSpace: 'nowrap' }}>
+                {showingDate ? `${d} ${dayNum}` : ''}
+              </td>
+              <td style={{ ...cell, color: '#475569', fontWeight: 600, verticalAlign: 'top' }}>{normalizeVisitRound(row.visitRound)}</td>
+              <td style={{ ...cell, color: '#334155', verticalAlign: 'top' }}>{row.acc}</td>
+              <td style={{ ...cell, color: '#1e293b', verticalAlign: 'top' }}>{row.name}</td>
+              <td style={{ ...cell, color: '#64748b', verticalAlign: 'top' }}>{row.area}</td>
+            </tr>
+          );
+        }),
+      );
+
     return (
       <div
         className="summary-print-wrap"
@@ -2022,7 +2111,7 @@ function App() {
           gap: '20px',
         }}
       >
-        <div className="summary-print-page-title">
+        <div className="summary-print-page-title no-print">
           {companyName.trim() ? (
             <span className="app-company-display">{companyName.trim()}</span>
           ) : null}
@@ -2031,7 +2120,7 @@ function App() {
             {agent ? ` · ${agent}` : ''}
           </span>
         </div>
-        <div className="summary-print-kpi-row" style={{ display: 'flex', gap: '16px', flexWrap: 'wrap' }}>
+        <div className="summary-print-kpi-row no-print" style={{ display: 'flex', gap: '16px', flexWrap: 'wrap' }}>
           {[
             { label: 'Total visits', value: totalVisits },
             { label: 'Customers', value: uniqueCustomers },
@@ -2054,7 +2143,8 @@ function App() {
           ))}
         </div>
 
-        <div className="summary-print-table-host" style={{ border: '1px solid #e2e8f0', borderRadius: '8px', overflow: 'hidden', background: 'white' }}>
+        {/* Screen: single continuous table */}
+        <div className="summary-print-table-host no-print" style={{ border: '1px solid #e2e8f0', borderRadius: '8px', overflow: 'hidden', background: 'white' }}>
           <table className="summary-print-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
             <thead>
               <tr style={{ background: '#1e293b', color: 'white', textAlign: 'left', fontSize: '12px' }}>
@@ -2065,28 +2155,50 @@ function App() {
                 <th style={{ ...cell, fontWeight: 600 }}>Area</th>
               </tr>
             </thead>
-            <tbody>
-              {dateKeys.flatMap((dateStr) =>
-                byDate[dateStr].map((row, idx) => {
-                  const d =
-                    row.weekday ?? weekdayAbbrevFromIso(dateStr);
-                  const dayNum = Number(dateStr.slice(-2));
-                  const showingDate = idx === 0;
-                  return (
-                    <tr key={`${dateStr}-${row.acc}-${idx}`} style={{ background: idx === 0 && showingDate ? '#fff' : 'white' }}>
-                      <td style={{ ...cell, color: '#0f172a', fontWeight: showingDate ? 600 : 400, verticalAlign: 'top', whiteSpace: 'nowrap' }}>
-                        {showingDate ? `${d} ${dayNum}` : ''}
-                      </td>
-                      <td style={{ ...cell, color: '#475569', fontWeight: 600, verticalAlign: 'top' }}>{normalizeVisitRound(row.visitRound)}</td>
-                      <td style={{ ...cell, color: '#334155', verticalAlign: 'top' }}>{row.acc}</td>
-                      <td style={{ ...cell, color: '#1e293b', verticalAlign: 'top' }}>{row.name}</td>
-                      <td style={{ ...cell, color: '#64748b', verticalAlign: 'top' }}>{row.area}</td>
-                    </tr>
-                  );
-                }),
-              )}
-            </tbody>
+            <tbody>{renderVisitRows(dateKeys)}</tbody>
           </table>
+        </div>
+
+        {/* Print/PDF: one week per sheet */}
+        <div className="summary-print-weeks">
+          {weekBuckets.map((week, wi) => {
+            const dayNums = week.dateKeys.map((d) => Number(d.slice(-2))).filter(Number.isFinite);
+            const lo = dayNums.length ? Math.min(...dayNums) : null;
+            const hi = dayNums.length ? Math.max(...dayNums) : null;
+            const span = lo == null ? '' : lo === hi ? `day ${lo}` : `days ${lo}–${hi}`;
+            const isLast = wi === weekBuckets.length - 1;
+            return (
+              <div
+                key={week.sundayIso}
+                className={`summary-week-page${isLast ? ' summary-week-page--last' : ''}`}
+              >
+                <div className="summary-print-page-title summary-week-page-title">
+                  {companyName.trim() ? (
+                    <span className="app-company-display">{companyName.trim()}</span>
+                  ) : null}
+                  <span className="summary-print-page-title-meta">
+                    Schedule summary · {monthLabel}
+                    {span ? ` · ${span}` : ''}
+                    {agent ? ` · ${agent}` : ''}
+                  </span>
+                </div>
+                <div className="summary-print-table-host" style={{ border: '1px solid #e2e8f0', borderRadius: '8px', overflow: 'hidden', background: 'white' }}>
+                  <table className="summary-print-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
+                    <thead>
+                      <tr style={{ background: '#1e293b', color: 'white', textAlign: 'left', fontSize: '12px' }}>
+                        <th style={{ ...cell, fontWeight: 600 }}>Date</th>
+                        <th style={{ ...cell, fontWeight: 600 }}>#</th>
+                        <th style={{ ...cell, fontWeight: 600 }}>Account</th>
+                        <th style={{ ...cell, fontWeight: 600 }}>Customer</th>
+                        <th style={{ ...cell, fontWeight: 600 }}>Area</th>
+                      </tr>
+                    </thead>
+                    <tbody>{renderVisitRows(week.dateKeys)}</tbody>
+                  </table>
+                </div>
+              </div>
+            );
+          })}
         </div>
       </div>
     );
@@ -2563,10 +2675,41 @@ function App() {
   const renderCalendar = () => (
     <div className="cal-calendar-body" style={{ width: '100%', minWidth: 0, flex: '1 1 auto', minHeight: 0 }}>
       <div
+        className="cal-weekday-header no-print"
         style={{
           display: 'grid',
           gridTemplateColumns: 'repeat(7, 1fr)',
-          alignItems: 'stretch',
+          width: 'max(100%, 800px)',
+          boxSizing: 'border-box',
+          background: '#f1f5f9',
+          border: '1px solid #e2e8f0',
+          borderBottom: 'none',
+        }}
+      >
+        {WEEKDAY_ABBREV_SUN0.map((label) => (
+          <div
+            key={label}
+            style={{
+              padding: '6px 4px',
+              textAlign: 'center',
+              fontSize: '11px',
+              fontWeight: 700,
+              letterSpacing: '0.04em',
+              textTransform: 'uppercase',
+              color: label === 'Sun' ? '#e11d48' : '#64748b',
+              borderRight: '1px solid #e2e8f0',
+              boxSizing: 'border-box',
+            }}
+          >
+            {label}
+          </div>
+        ))}
+      </div>
+      <div
+        className="cal-weeks-stack"
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
           width: 'max(100%, 800px)',
           boxSizing: 'border-box',
         }}
@@ -2584,6 +2727,9 @@ function App() {
             removeScheduledVisit={removeScheduledVisit}
             calendarFilterAcc={calendarFilterAcc}
             calendarChipRoundFilter={calendarChipRoundFilter}
+            monthLabel={monthLabel}
+            companyName={companyName}
+            isLastWeek={wi === calendarWeeks.length - 1}
             onDayDoubleClick={(dateStr) => {
               if (!agent) return;
               setCalendarDayDetailDateStr(dateStr);
@@ -2618,7 +2764,7 @@ function App() {
             min-height: 0 !important;
             flex: none !important;
           }
-          @page { margin: 12mm; size: auto; }
+          @page { margin: 10mm; size: landscape; }
           .app-root-shell {
             display: block !important;
             width: 100% !important;
@@ -2635,7 +2781,7 @@ function App() {
             background: white !important;
           }
           .main-scroll-region {
-            padding: 12px 16px !important;
+            padding: 0 !important;
             overflow: visible !important;
             height: auto !important;
             max-height: none !important;
@@ -2647,36 +2793,125 @@ function App() {
             height: auto !important;
             max-height: none !important;
             flex: none !important;
-            border-left: none !important;
-            border-right: none !important;
+            border: none !important;
           }
-          .cal-calendar-body > div {
+          .schedule-strip-print {
+            display: none !important;
+          }
+          .cal-calendar-body {
+            width: 100% !important;
+          }
+          .cal-calendar-body > .cal-weeks-stack,
+          .cal-weeks-stack {
             width: 100% !important;
             min-width: 0 !important;
+          }
+          .cal-week-print-banner {
+            display: flex !important;
+            justify-content: space-between;
+            align-items: baseline;
+            gap: 12px;
+            margin: 0 0 6px 0;
+            padding: 0 2px;
+            font-size: 10pt;
+            font-weight: 700;
+            color: #0f172a;
+          }
+          .cal-week-print-banner span:last-child {
+            font-size: 8pt;
+            font-weight: 600;
+            color: #64748b;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+          }
+          .cal-week-print-weekdays {
+            display: grid !important;
+            grid-template-columns: repeat(7, 1fr);
+            width: 100%;
+            box-sizing: border-box;
+            background: #e2e8f0;
+            border: 1px solid #cbd5e1;
+            border-bottom: none;
+          }
+          .cal-week-print-weekdays > div {
+            padding: 4px 2px;
+            text-align: center;
+            font-size: 8pt;
+            font-weight: 700;
+            letter-spacing: 0.03em;
+            text-transform: uppercase;
+            color: #334155;
+            border-right: 1px solid #cbd5e1;
+            box-sizing: border-box;
+          }
+          .cal-week-print-weekdays > div:first-child {
+            color: #e11d48;
+          }
+          .cal-week-block {
+            break-after: page;
+            page-break-after: always;
+            break-inside: avoid;
+            page-break-inside: avoid;
+            width: 100% !important;
+            box-sizing: border-box;
+          }
+          .cal-week-block--last {
+            break-after: auto;
+            page-break-after: auto;
+          }
+          .cal-week-row {
+            width: 100% !important;
+          }
+          .cal-day-cell,
+          .cal-pad-cell {
+            min-height: 68mm !important;
+            height: 68mm !important;
+          }
+          .cal-day-cell {
+            padding: 6px !important;
+          }
+          .cal-day-tasks {
+            max-height: none !important;
+            overflow: visible !important;
           }
           .summary-print-wrap {
             overflow: visible !important;
             max-height: none !important;
-            padding: 12px 0 !important;
+            padding: 0 !important;
             display: block !important;
             flex: none !important;
+            gap: 0 !important;
           }
-          .summary-print-page-title {
+          .summary-print-weeks {
             display: block !important;
-            margin: 0 0 14px 0 !important;
+          }
+          .summary-week-page {
+            break-after: page;
+            page-break-after: always;
+            break-inside: avoid;
+            page-break-inside: avoid;
+            padding: 4px 0 8px;
+          }
+          .summary-week-page--last {
+            break-after: auto;
+            page-break-after: auto;
+          }
+          .summary-week-page-title {
+            display: block !important;
+            margin: 0 0 10px 0 !important;
             padding: 0 !important;
           }
           .summary-print-page-title .app-company-display {
             display: block !important;
-            font-size: 22pt !important;
-            margin-bottom: 6px !important;
+            font-size: 16pt !important;
+            margin-bottom: 4px !important;
             color: #0f172a !important;
             -webkit-text-fill-color: #0f172a !important;
             background: none !important;
           }
           .summary-print-page-title-meta {
             display: block !important;
-            font-size: 11pt !important;
+            font-size: 10pt !important;
             font-weight: 600 !important;
             color: #475569 !important;
             letter-spacing: 0.04em !important;
@@ -2700,17 +2935,13 @@ function App() {
             break-inside: avoid;
             page-break-inside: avoid;
           }
-          .schedule-strip-print {
-            border-radius: 0 !important;
-            -webkit-print-color-adjust: exact !important;
-            print-color-adjust: exact !important;
-          }
-          .cal-day-tasks {
-            max-height: none !important;
-            overflow: visible !important;
-          }
         }
         .summary-print-page-title {
+          display: none;
+        }
+        .cal-week-print-banner,
+        .cal-week-print-weekdays,
+        .summary-print-weeks {
           display: none;
         }
         .import-sr-only {
@@ -2886,7 +3117,7 @@ function App() {
       {/* Sidebar: top controls fixed, customer list fills remaining viewport and scrolls */}
       <aside className="no-print" style={{ width: '238px', minWidth: '238px', minHeight: 0, alignSelf: 'stretch', background: 'linear-gradient(180deg, #0f172a 0%, #0c1222 100%)', color: 'white', padding: '5px 5px', display: 'flex', flexDirection: 'column', boxSizing: 'border-box', borderRight: '1px solid rgba(148, 163, 184, 0.12)', overflow: 'hidden' }}>
         <div style={{ flexShrink: 0 }}>
-        <h2 style={{ color: '#60a5fa', textAlign: 'center', margin: '0', fontSize: '0.75rem', fontWeight: 800, letterSpacing: '0.05em', lineHeight: 1.15 }}>
+        <h2 style={{ color: '#60a5fa', textAlign: 'center', margin: '0', fontSize: '0.75rem', fontWeight: 800, letterSpacing: '0.05em', lineHeight: 1.15, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '3px' }}>
           <span
             aria-hidden
             onClick={(e) => {
@@ -2916,9 +3147,21 @@ function App() {
               restoreElectronWindowKeyboardFocus();
             }}
             title=""
-            style={{ cursor: 'inherit', userSelect: 'none', display: 'inline-block', marginRight: '1px' }}
+            style={{ cursor: 'inherit', userSelect: 'none', display: 'inline-flex', alignItems: 'center', marginRight: '1px' }}
           >
-            📍
+            <img
+              src={routeProLogo}
+              alt=""
+              draggable={false}
+              style={{
+                width: '14px',
+                height: '14px',
+                objectFit: 'cover',
+                objectPosition: 'center 18%',
+                borderRadius: '50%',
+                display: 'block',
+              }}
+            />
           </span>
           ROUTE PR
           <span
@@ -3600,7 +3843,7 @@ function App() {
           <button
             type="button"
             onClick={() => window.print()}
-            title="Open Summary, set the From/To day range in the toolbar, then print or save as PDF."
+            title="Print or save as PDF: one calendar week (Sun–Sat) per page. Use Summary for a visit list, also one week per page."
             style={{ background: '#2563eb', color: 'white', border: 'none', padding: '10px 25px', borderRadius: '8px', cursor: 'pointer', fontWeight:'bold' }}
           >
             PRINT / PDF

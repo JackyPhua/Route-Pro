@@ -14,6 +14,10 @@ function setupAutoUpdate(win) {
       console.warn('route-planner: autoUpdater error', err?.message ?? err);
     });
 
+    autoUpdater.on('update-available', (info) => {
+      console.info('route-planner: update available', info?.version ?? info);
+    });
+
     autoUpdater.on('update-downloaded', (info) => {
       const parent =
         win && !win.isDestroyed() ? win : BrowserWindow.getFocusedWindow() ?? undefined;
@@ -33,11 +37,9 @@ function setupAutoUpdate(win) {
         .catch(() => {});
     });
 
-    setTimeout(() => {
-      autoUpdater.checkForUpdates().catch((err) => {
-        console.warn('route-planner: checkForUpdates failed', err?.message ?? err);
-      });
-    }, 8000);
+    autoUpdater.checkForUpdatesAndNotify().catch((err) => {
+      console.warn('route-planner: checkForUpdates failed', err?.message ?? err);
+    });
   } catch (err) {
     console.warn('route-planner: autoUpdater unavailable', err?.message ?? err);
   }
@@ -112,6 +114,14 @@ function attachRendererDiagnostics(win) {
 /** @type {import('electron').BrowserWindow | null} */
 let mainWindow = null;
 
+function resolveAppIcon() {
+  const ico = path.join(__dirname, 'icon.ico');
+  const png = path.join(__dirname, 'icon.png');
+  if (fs.existsSync(ico)) return ico;
+  if (fs.existsSync(png)) return png;
+  return undefined;
+}
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1360,
@@ -119,6 +129,7 @@ function createWindow() {
     minWidth: 900,
     minHeight: 600,
     title: 'Route Planner',
+    icon: resolveAppIcon(),
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
