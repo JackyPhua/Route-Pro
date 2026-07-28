@@ -130,8 +130,245 @@ const VISIT_BUCKET_PALETTE = {
 };
 const UNSCHED_SIDEBAR = { sidebarBg: '#334155', sidebarBorder: '#3b82f6', badgeBg: null };
 
-const CAL_CHIP_FONT_MIN = 7;
+const CAL_CHIP_FONT_MIN = 5;
 const CAL_CHIP_FONT_MAX = 12;
+
+const CAL_CHIP_BADGE_W = 20;
+const CAL_CHIP_BTN_SIZE = 22;
+
+/** Estimate chip layout before row measure runs (avoids flash on first paint). */
+function estimateRowChipMetrics(maxTaskCount) {
+  if (maxTaskCount <= 0) {
+    return { fontPx: CAL_CHIP_FONT_MAX, gap: 4, padV: 4, numPx: 10, badgeW: CAL_CHIP_BADGE_W, btnSize: CAL_CHIP_BTN_SIZE, slotH: 26 };
+  }
+  if (maxTaskCount <= 3) {
+    return { fontPx: 11, gap: 4, padV: 4, numPx: 10, badgeW: CAL_CHIP_BADGE_W, btnSize: CAL_CHIP_BTN_SIZE, slotH: 26 };
+  }
+  if (maxTaskCount <= 6) {
+    return { fontPx: 9, gap: 3, padV: 3, numPx: 9, badgeW: CAL_CHIP_BADGE_W, btnSize: CAL_CHIP_BTN_SIZE, slotH: 22 };
+  }
+  if (maxTaskCount <= 10) {
+    return { fontPx: 8, gap: 2, padV: 2, numPx: 7, badgeW: CAL_CHIP_BADGE_W, btnSize: CAL_CHIP_BTN_SIZE, slotH: 18 };
+  }
+  return { fontPx: 7, gap: 2, padV: 2, numPx: 6, badgeW: CAL_CHIP_BADGE_W, btnSize: CAL_CHIP_BTN_SIZE, slotH: 14 };
+}
+
+/** 整周行统一 slot 高度 + 左右规格；各格条目横向贴齐、纵向按行对齐 */
+function computeRowChipMetrics(maxTaskCount, availHeight, textWidth, tasks, measureEl) {
+  if (maxTaskCount <= 0) return estimateRowChipMetrics(0);
+
+  const n = maxTaskCount;
+  const gap = n > 12 ? 2 : n > 8 ? 3 : n > 4 ? 4 : 4;
+  const availForSlots = Math.max(20, availHeight - gap * Math.max(0, n - 1));
+  const slotH = Math.max(14, Math.min(28, Math.round((availForSlots / n) * 10) / 10));
+
+  let fontPx = Math.min(CAL_CHIP_FONT_MAX, Math.max(CAL_CHIP_FONT_MIN, slotH * 0.42));
+  const padV = slotH >= 24 ? 4 : slotH >= 18 ? 3 : 2;
+
+  const w = Math.max(24, textWidth);
+  measureEl.style.width = `${w}px`;
+  for (const t of tasks) {
+    let size = fontPx;
+    measureEl.textContent = t.name ?? '';
+    measureEl.style.fontSize = `${size}px`;
+    while (size > CAL_CHIP_FONT_MIN && measureEl.scrollWidth > w + 0.5) {
+      size -= 0.5;
+      measureEl.style.fontSize = `${size}px`;
+    }
+    fontPx = Math.min(fontPx, size);
+  }
+
+  fontPx = Math.max(CAL_CHIP_FONT_MIN, Math.round(fontPx * 2) / 2);
+  const numPx = Math.max(CAL_CHIP_FONT_MIN, Math.min(10, fontPx - 0.5));
+
+  return {
+    fontPx,
+    gap,
+    padV,
+    numPx,
+    badgeW: CAL_CHIP_BADGE_W,
+    btnSize: CAL_CHIP_BTN_SIZE,
+    slotH,
+  };
+}
+
+const PRINT_SCALE_SELECTORS = '.summary-print-wrap, .cal-print-sheet';
+
+function printLandscapeCellMetrics() {
+  const weekCount = Math.max(1, document.querySelectorAll('.cal-week-block').length);
+  return {
+    weekCount,
+    cellH: (((200 - 14) * 96) / 25.4) / weekCount,
+    cellW: (((287 - 4) * 96) / 25.4) / 7,
+  };
+}
+
+function resetCalendarPrintFonts() {
+  document.querySelectorAll('.cal-day-tasks').forEach((el) => {
+    el.style.removeProperty('--cal-print-font-size');
+    el.style.removeProperty('--cal-print-num-font-size');
+    el.style.removeProperty('--cal-print-line-height');
+  });
+  document.querySelectorAll('.cal-day-task-chip [data-cal-chip-text], .cal-day-task-chip span[aria-hidden]').forEach((el) => {
+    if (el instanceof HTMLElement) {
+      el.style.removeProperty('font-size');
+      el.style.removeProperty('line-height');
+    }
+  });
+  document.querySelectorAll('.cal-day-task-chip').forEach((el) => {
+    if (el instanceof HTMLElement) {
+      el.style.removeProperty('min-height');
+      el.style.removeProperty('padding');
+    }
+  });
+}
+
+function resetPrintScale() {
+  document.body.classList.remove('print-fit-one-page', 'print-calendar-view', 'print-summary-view');
+  document.querySelectorAll(PRINT_SCALE_SELECTORS).forEach((el) => {
+    el.style.transform = '';
+    el.style.zoom = '';
+    el.style.width = '';
+    el.style.height = '';
+    el.style.marginBottom = '';
+  });
+  resetCalendarPrintFonts();
+}
+
+/** Shrink print font per day cell so every scheduled customer line fits (compact rows) */
+function fitCalendarPrintCellFonts() {
+  const measureEl = document.createElement('span');
+  measureEl.style.cssText = [
+    'position:absolute',
+    'left:-99999px',
+    'top:0',
+    'visibility:hidden',
+    'white-space:nowrap',
+    'font-family:system-ui,-apple-system,"Segoe UI",sans-serif',
+    'font-weight:700',
+  ].join(';');
+  document.body.appendChild(measureEl);
+
+  try {
+    const { cellH: fallbackCellH, cellW: fallbackCellW } = printLandscapeCellMetrics();
+
+    document.querySelectorAll('.cal-day-cell').forEach((cell) => {
+      const tasksCol = cell.querySelector('.cal-day-tasks');
+      if (!tasksCol) return;
+      const chips = tasksCol.querySelectorAll('.cal-day-task-chip');
+      const n = chips.length;
+      if (n === 0) return;
+
+      tasksCol.setAttribute('data-task-count', String(n));
+
+      const cellH = fallbackCellH;
+      const cellW = fallbackCellW;
+      const textW = Math.max(16, cellW - 18);
+      const availH = Math.max(8, cellH - 4);
+      const gapPx = n > 1 ? 0.8 : 0;
+
+      let fontPx = Math.min(7.5, (availH - gapPx * (n - 1)) / n * 0.9);
+      fontPx = Math.max(2.8, fontPx);
+
+      chips.forEach((chip) => {
+        const textEl = chip.querySelector('[data-cal-chip-text]');
+        const text = textEl?.textContent ?? chip.querySelector('[data-cal-chip-text]')?.textContent ?? '';
+        let size = fontPx;
+        measureEl.textContent = text;
+        measureEl.style.fontSize = `${size}px`;
+        while (size > 2.5 && measureEl.scrollWidth > textW - 6) {
+          size -= 0.25;
+          measureEl.style.fontSize = `${size}px`;
+        }
+        fontPx = Math.min(fontPx, size);
+      });
+
+      fontPx = Math.max(2.5, Math.round(fontPx * 4) / 4);
+      const numPx = Math.max(2.5, fontPx - 0.35);
+      const lineH = 1.05;
+      tasksCol.style.setProperty('--cal-print-font-size', `${fontPx}px`);
+      tasksCol.style.setProperty('--cal-print-num-font-size', `${numPx}px`);
+      tasksCol.style.setProperty('--cal-print-line-height', String(lineH));
+      tasksCol.style.setProperty('gap', `${gapPx}px`);
+
+      chips.forEach((chip) => {
+        if (!(chip instanceof HTMLElement)) return;
+        chip.style.setProperty('min-height', '0', 'important');
+        chip.style.setProperty('padding', '0', 'important');
+        const textEl = chip.querySelector('[data-cal-chip-text]');
+        const numEl = chip.querySelector('span[aria-hidden]');
+        if (textEl instanceof HTMLElement) {
+          textEl.style.setProperty('font-size', `${fontPx}px`, 'important');
+          textEl.style.setProperty('line-height', String(lineH), 'important');
+        }
+        if (numEl instanceof HTMLElement) {
+          numEl.style.setProperty('font-size', `${numPx}px`, 'important');
+          numEl.style.setProperty('line-height', String(lineH), 'important');
+          numEl.style.setProperty('min-height', '0', 'important');
+          numEl.style.setProperty('height', 'auto', 'important');
+        }
+      });
+    });
+  } finally {
+    measureEl.remove();
+  }
+}
+
+function fitElementToOnePage(el, orientation = 'landscape', minScale = 0.35) {
+  el.style.transform = '';
+  el.style.zoom = '';
+  el.style.width = '';
+  el.style.height = '';
+  el.style.marginBottom = '';
+  const marginMm = 10;
+  const pageW = orientation === 'portrait' ? 210 : 297;
+  const pageH = orientation === 'portrait' ? 297 : 210;
+  const maxW = ((pageW - marginMm) * 96) / 25.4;
+  const maxH = ((pageH - marginMm) * 96) / 25.4;
+  const h = el.scrollHeight;
+  const w = el.scrollWidth;
+  const scaleH = h > 0 ? maxH / h : 1;
+  const scaleW = w > 0 ? maxW / w : 1;
+  const scale = Math.min(1, Math.max(minScale, Math.min(scaleH, scaleW)));
+  if (scale >= 0.999) return;
+  el.style.zoom = String(scale);
+  el.style.width = `${100 / scale}%`;
+}
+
+function fitElementToOneLandscapePage(el, minScale = 0.35) {
+  fitElementToOnePage(el, 'landscape', minScale);
+}
+
+function fitElementToOnePortraitPage(el, minScale = 0.35) {
+  fitElementToOnePage(el, 'portrait', minScale);
+}
+
+function preparePrintLayout() {
+  resetPrintScale();
+  document.body.classList.add('print-fit-one-page');
+
+  const summary = document.querySelector('.summary-print-wrap:not(.summary-print-empty)');
+  if (summary) {
+    document.body.classList.add('print-summary-view');
+    fitElementToOnePortraitPage(summary);
+    return;
+  }
+
+  if (document.querySelector('.cal-print-sheet')) {
+    document.body.classList.add('print-calendar-view');
+    fitCalendarPrintCellFonts();
+  }
+}
+
+function runPrintWithLayout() {
+  preparePrintLayout();
+  window.requestAnimationFrame(() => {
+    preparePrintLayout();
+    window.requestAnimationFrame(() => {
+      window.print();
+    });
+  });
+}
 
 /** 有效拜访序号，至少为 1 */
 function normalizeVisitRound(r) {
@@ -427,20 +664,27 @@ function colorBucketFromRound(round) {
   return Math.min(normalizeVisitRound(round), 6);
 }
 
-/** 单日格拜访条列表；字号由外层 CalWeekRow 按「整周一排」统一计算后传入 fontPx */
-function CalDayTasksColumn({ dateStr, tasks, removeScheduledVisit, fontPx }) {
+/** 单日格拜访条列表；整行 slot 等高、左右贴齐，顾客少时下方留白 */
+function CalDayTasksColumn({ dateStr, tasks, removeScheduledVisit, metrics }) {
+  const { fontPx, gap, padV, numPx, badgeW, btnSize, slotH } =
+    metrics ?? estimateRowChipMetrics(tasks.length);
+
   return (
     <div
       className="cal-day-tasks"
+      data-task-count={tasks.length || undefined}
       style={{
-        marginTop: '8px',
+        marginTop: '6px',
         display: 'flex',
         flexDirection: 'column',
-        gap: '7px',
+        gap: `${gap}px`,
         flex: '1 1 auto',
-        minHeight: '48px',
+        minHeight: 0,
         minWidth: 0,
+        width: '100%',
+        alignSelf: 'stretch',
         overflowX: 'hidden',
+        overflowY: tasks.length > 0 ? 'auto' : 'visible',
         WebkitOverflowScrolling: 'touch',
         overscrollBehavior: 'contain',
         position: 'relative',
@@ -456,6 +700,7 @@ function CalDayTasksColumn({ dateStr, tasks, removeScheduledVisit, fontPx }) {
         return (
           <div
             key={`${dateStr}-${t.acc}-${r}`}
+            className="cal-day-task-chip"
             draggable
             title={`${t.name} · ACC ${t.acc}`}
             onDragStart={(e) =>
@@ -464,28 +709,36 @@ function CalDayTasksColumn({ dateStr, tasks, removeScheduledVisit, fontPx }) {
             style={{
               display: 'flex',
               alignItems: 'center',
-              gap: '7px',
+              gap: '4px',
               background: chipBg,
               color: chipFg,
-              padding: '5px 7px 5px 9px',
-              borderRadius: '7px',
+              padding: `${padV}px 4px`,
+              borderRadius: '4px',
               cursor: 'move',
               overflow: 'hidden',
-              minHeight: '26px',
+              flex: `0 0 ${slotH}px`,
+              height: `${slotH}px`,
+              minHeight: `${slotH}px`,
+              maxHeight: `${slotH}px`,
+              width: '100%',
+              alignSelf: 'stretch',
+              boxSizing: 'border-box',
               border: `1px solid rgba(255,255,255,0.22)`,
+              ['--visit-round-color']: chipBg,
             }}
           >
             <span
               style={{
                 flexShrink: 0,
-                minWidth: '20px',
-                height: '18px',
-                padding: '0 2px',
+                width: `${badgeW}px`,
+                minWidth: `${badgeW}px`,
+                height: `${badgeW}px`,
+                padding: 0,
                 display: 'inline-flex',
                 alignItems: 'center',
                 justifyContent: 'center',
-                borderRadius: '4px',
-                fontSize: '10px',
+                borderRadius: '3px',
+                fontSize: `${numPx}px`,
                 fontWeight: 800,
                 background: 'rgba(0,0,0,0.2)',
                 color: chipFg,
@@ -500,15 +753,15 @@ function CalDayTasksColumn({ dateStr, tasks, removeScheduledVisit, fontPx }) {
                 flex: 1,
                 minWidth: 0,
                 color: chipFg,
-                fontSize: fontPx,
-                lineHeight: 1.2,
+                fontSize: `${fontPx}px`,
+                lineHeight: 1.1,
                 whiteSpace: 'nowrap',
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
                 fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
               }}
             >
-              {`• ${t.acc}`}
+              {t.name}
             </span>
             <button
               type="button"
@@ -524,14 +777,15 @@ function CalDayTasksColumn({ dateStr, tasks, removeScheduledVisit, fontPx }) {
               title="Remove from this day"
               style={{
                 flexShrink: 0,
-                width: '22px',
-                height: '22px',
+                width: `${btnSize}px`,
+                minWidth: `${btnSize}px`,
+                height: `${btnSize}px`,
                 padding: 0,
                 margin: 0,
                 border: 'none',
-                borderRadius: '4px',
+                borderRadius: '3px',
                 cursor: 'pointer',
-                fontSize: '15px',
+                fontSize: `${Math.max(10, fontPx + 1)}px`,
                 lineHeight: 1,
                 fontWeight: 700,
                 display: 'inline-flex',
@@ -562,7 +816,7 @@ function monthWeekSlots(firstDay, totalDays) {
   return weeks;
 }
 
-/** 一周内所有拜访条共用同一字号（整排行同步缩放）；宽度取自该行任一条的文字区（各列等宽） */
+/** 整周行统一左右规格；格高由 grid stretch，条在格内纵向拉伸 */
 function CalWeekRow({
   weekCells,
   monthIsoPad,
@@ -577,7 +831,7 @@ function CalWeekRow({
   onDayDoubleClick,
 }) {
   const rowHostRef = useRef(null);
-  const [rowFontPx, setRowFontPx] = useState(CAL_CHIP_FONT_MAX);
+  const [rowMetrics, setRowMetrics] = useState(null);
 
   const enriched = useMemo(
     () =>
@@ -600,32 +854,49 @@ function CalWeekRow({
     [weekCells, monthIsoPad, year, agent, schedules, calendarFilterAcc, calendarChipRoundFilter],
   );
 
-  const rowTaskCount = useMemo(
-    () => enriched.reduce((n, c) => n + (c.kind === 'day' ? c.tasks.length : 0), 0),
+  const rowMaxTasks = useMemo(
+    () =>
+      enriched.reduce(
+        (max, c) => (c.kind === 'day' ? Math.max(max, c.tasks.length) : max),
+        0,
+      ),
     [enriched],
   );
 
   const rowTaskKey = useMemo(
     () =>
-      `${agent}\u0003` +
+      `${agent}\u0003${rowMaxTasks}\u0003` +
       enriched
         .filter((c) => c.kind === 'day')
         .flatMap((c) => c.tasks)
         .map((t) => `${t.acc}\u0001${t.name}\u0001${normalizeVisitRound(t.visitRound ?? 1)}`)
         .join('\u0002'),
-    [enriched, agent],
+    [enriched, agent, rowMaxTasks],
   );
+
+  const metricsForRow = rowMetrics ?? estimateRowChipMetrics(rowMaxTasks);
 
   useLayoutEffect(() => {
     const host = rowHostRef.current;
-    if (!host || rowTaskCount === 0) {
-      setRowFontPx(CAL_CHIP_FONT_MAX);
+    if (!host || rowMaxTasks === 0) {
+      setRowMetrics(null);
       return;
     }
+
     const measureRow = () => {
-      const probe = host.querySelector('[data-cal-chip-text]');
-      const w = probe instanceof HTMLElement ? probe.clientWidth : 0;
-      if (w < 6) return;
+      const sampleCell = host.querySelector('.cal-day-cell[data-cal-date]');
+      if (!(sampleCell instanceof HTMLElement)) return;
+
+      const dayLabel = sampleCell.querySelector('b');
+      const labelH = dayLabel instanceof HTMLElement ? dayLabel.offsetHeight : 22;
+      const availH = Math.max(20, sampleCell.clientHeight - labelH - 6 - 4);
+
+      const textW = Math.max(
+        40,
+        sampleCell.clientWidth - 8 - CAL_CHIP_BADGE_W - CAL_CHIP_BTN_SIZE - 12,
+      );
+
+      const allTasks = enriched.filter((c) => c.kind === 'day').flatMap((c) => c.tasks);
 
       const measureEl = document.createElement('span');
       measureEl.style.cssText = [
@@ -637,28 +908,17 @@ function CalWeekRow({
         'white-space:nowrap',
         'overflow:hidden',
         'display:block',
-        `width:${w}px`,
-        'line-height:1.2',
+        'line-height:1.1',
         'margin:0',
         'padding:0',
         'box-sizing:border-box',
         'font-family:system-ui,-apple-system,"Segoe UI",sans-serif',
       ].join(';');
-
       document.body.appendChild(measureEl);
-      let synced = CAL_CHIP_FONT_MAX;
+
+      let next;
       try {
-        const allVisits = enriched.filter((c) => c.kind === 'day').flatMap((c) => c.tasks);
-        for (const t of allVisits) {
-          let size = CAL_CHIP_FONT_MAX;
-          measureEl.textContent = `• ${t.acc}`;
-          measureEl.style.fontSize = `${size}px`;
-          while (size > CAL_CHIP_FONT_MIN && measureEl.scrollWidth > w + 0.5) {
-            size -= 0.5;
-            measureEl.style.fontSize = `${size}px`;
-          }
-          synced = Math.min(synced, size);
-        }
+        next = computeRowChipMetrics(rowMaxTasks, availH, textW, allTasks, measureEl);
       } finally {
         try {
           measureEl.remove();
@@ -666,10 +926,18 @@ function CalWeekRow({
           /* ignore detach errors */
         }
       }
-      setRowFontPx((prev) => {
-        const snapped = Math.round(synced * 2) / 2;
-        const prevSnapped = Math.round(prev * 2) / 2;
-        return Math.abs(prevSnapped - snapped) < 0.11 ? prev : snapped;
+
+      setRowMetrics((prev) => {
+        if (
+          prev &&
+          prev.fontPx === next.fontPx &&
+          prev.gap === next.gap &&
+          prev.slotH === next.slotH &&
+          prev.badgeW === next.badgeW
+        ) {
+          return prev;
+        }
+        return next;
       });
     };
 
@@ -678,7 +946,7 @@ function CalWeekRow({
     try {
       measureRow();
     } catch (err) {
-      console.warn('route-planner: row font measure failed', err);
+      console.warn('route-planner: row chip measure failed', err);
       return;
     }
 
@@ -686,12 +954,12 @@ function CalWeekRow({
       try {
         measureRow();
       } catch (err) {
-        console.warn('route-planner: row font measure on resize failed', err);
+        console.warn('route-planner: row chip measure on resize failed', err);
       }
     };
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);
-  }, [rowTaskCount, rowTaskKey, enriched]);
+  }, [rowMaxTasks, rowTaskKey, enriched]);
 
   return (
     <div className="cal-week-block" style={{ width: '100%', boxSizing: 'border-box' }}>
@@ -700,7 +968,7 @@ function CalWeekRow({
         className="cal-week-row"
         style={{
           display: 'grid',
-          gridTemplateColumns: 'repeat(7, 1fr)',
+          gridTemplateColumns: 'repeat(7, minmax(0, 1fr))',
           alignItems: 'stretch',
           width: '100%',
           boxSizing: 'border-box',
@@ -716,6 +984,7 @@ function CalWeekRow({
                   background: '#f8fafc',
                   border: '1px solid #e2e8f0',
                   minHeight: '144px',
+                  height: '100%',
                   boxSizing: 'border-box',
                 }}
               />
@@ -734,6 +1003,7 @@ function CalWeekRow({
             <div
               key={cell.key}
               className="cal-day-cell"
+              data-cal-date={dateStr}
               data-cal-focus-day={dayNum}
               onDragOver={(e) => e.preventDefault()}
               onDrop={(e) => {
@@ -745,10 +1015,13 @@ function CalWeekRow({
               title={cellTitle}
               style={{
                 minHeight: '144px',
+                height: '100%',
+                minWidth: 0,
                 display: 'flex',
                 flexDirection: 'column',
+                alignItems: 'stretch',
                 border: '1px solid #cbd5e1',
-                padding: '10px',
+                padding: '6px 4px',
                 background: holidayName ? '#fef08a' : (isSun ? '#ffe4e6' : 'white'),
                 position: 'relative',
                 boxSizing: 'border-box',
@@ -761,7 +1034,7 @@ function CalWeekRow({
                 dateStr={dateStr}
                 tasks={tasks}
                 removeScheduledVisit={removeScheduledVisit}
-                fontPx={rowFontPx}
+                metrics={metricsForRow}
               />
             </div>
           );
@@ -1839,37 +2112,7 @@ function App() {
   }, [companyName]);
 
   useEffect(() => {
-    const PRINT_SCALE_SELECTORS = '.summary-print-wrap, .cal-calendar-body';
-
-    const resetPrintScale = () => {
-      document.querySelectorAll(PRINT_SCALE_SELECTORS).forEach((el) => {
-        el.style.transform = '';
-        el.style.width = '';
-        el.style.marginBottom = '';
-      });
-    };
-
-    const fitElementToOneLandscapePage = (el, minScale = 0.35) => {
-      const maxH = ((210 - 12) * 96) / 25.4;
-      const h = el.scrollHeight;
-      if (h <= maxH) return;
-      const scale = Math.max(minScale, maxH / h);
-      el.style.transform = `scale(${scale})`;
-      el.style.width = `${100 / scale}%`;
-      el.style.marginBottom = `${-(h * (1 - scale))}px`;
-    };
-
-    /** Scale active print view to one landscape sheet when content overflows */
-    const fitPrintToOnePage = () => {
-      resetPrintScale();
-      const summary = document.querySelector('.summary-print-wrap:not(.summary-print-empty)');
-      if (summary) {
-        fitElementToOneLandscapePage(summary);
-        return;
-      }
-      const calendar = document.querySelector('.cal-calendar-body');
-      if (calendar) fitElementToOneLandscapePage(calendar, 0.22);
-    };
+    const fitPrintToOnePage = () => preparePrintLayout();
 
     window.addEventListener('beforeprint', fitPrintToOnePage);
     window.addEventListener('afterprint', resetPrintScale);
@@ -1877,6 +2120,10 @@ function App() {
       window.removeEventListener('beforeprint', fitPrintToOnePage);
       window.removeEventListener('afterprint', resetPrintScale);
     };
+  }, []);
+
+  const handlePrintPdf = useCallback(() => {
+    runPrintWithLayout();
   }, []);
 
   const dismissSettingsDialog = useCallback(() => {
@@ -2615,72 +2862,75 @@ function App() {
   }, [agent, year, month]);
 
   const renderCalendar = () => (
-    <div className="cal-calendar-body" style={{ width: '100%', minWidth: 0, flex: '1 1 auto', minHeight: 0 }}>
-      <div className="cal-calendar-print-header">
-        <span>
-          {companyName.trim() ? `${companyName.trim()} · ` : ''}
-          {agent || 'NOT SELECTED'} · {monthLabel}
-        </span>
-      </div>
-      <div
-        className="cal-weekday-header"
-        style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(7, 1fr)',
-          width: 'max(100%, 800px)',
-          boxSizing: 'border-box',
-          background: '#f1f5f9',
-          border: '1px solid #e2e8f0',
-          borderBottom: 'none',
-        }}
-      >
-        {WEEKDAY_ABBREV_SUN0.map((label) => (
-          <div
-            key={label}
-            style={{
-              padding: '6px 4px',
-              textAlign: 'center',
-              fontSize: '11px',
-              fontWeight: 700,
-              letterSpacing: '0.04em',
-              textTransform: 'uppercase',
-              color: label === 'Sun' ? '#e11d48' : '#64748b',
-              borderRight: '1px solid #e2e8f0',
-              boxSizing: 'border-box',
-            }}
-          >
-            {label}
-          </div>
-        ))}
-      </div>
-      <div
-        className="cal-weeks-stack"
-        style={{
-          display: 'flex',
-          flexDirection: 'column',
-          width: 'max(100%, 800px)',
-          boxSizing: 'border-box',
-        }}
-      >
-        {calendarWeeks.map((weekCells, wi) => (
-          <CalWeekRow
-            key={`week-${wi}-${year}-${month}`}
-            weekCells={weekCells}
-            monthIsoPad={monthIsoPad}
-            year={year}
-            agent={agent}
-            schedules={schedules}
-            highlightedDayNum={highlightedDay}
-            dropOnDate={(dateStr, raw) => onDrop(dateStr, raw)}
-            removeScheduledVisit={removeScheduledVisit}
-            calendarFilterAcc={calendarFilterAcc}
-            calendarChipRoundFilter={calendarChipRoundFilter}
-            onDayDoubleClick={(dateStr) => {
-              if (!agent) return;
-              setCalendarDayDetailDateStr(dateStr);
-            }}
-          />
-        ))}
+    <div className="cal-print-sheet">
+      <div className="cal-calendar-body" style={{ width: '100%', minWidth: 0, flex: '1 1 auto', minHeight: 0 }}>
+        <div className="cal-calendar-print-header">
+          <span>
+            {companyName.trim() ? `${companyName.trim()} · ` : ''}
+            {agent || 'NOT SELECTED'} · {monthLabel}
+          </span>
+        </div>
+        <div
+          className="cal-weekday-header"
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(7, minmax(0, 1fr))',
+            width: 'max(100%, 800px)',
+            boxSizing: 'border-box',
+            background: '#f1f5f9',
+            border: '1px solid #e2e8f0',
+            borderBottom: 'none',
+          }}
+        >
+          {WEEKDAY_ABBREV_SUN0.map((label) => (
+            <div
+              key={label}
+              style={{
+                padding: '6px 4px',
+                textAlign: 'center',
+                fontSize: '11px',
+                fontWeight: 700,
+                letterSpacing: '0.04em',
+                textTransform: 'uppercase',
+                color: label === 'Sun' ? '#e11d48' : '#64748b',
+                borderRight: '1px solid #e2e8f0',
+                boxSizing: 'border-box',
+              }}
+            >
+              {label}
+            </div>
+          ))}
+        </div>
+        <div
+          className="cal-weeks-stack"
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            width: 'max(100%, 800px)',
+            boxSizing: 'border-box',
+            ['--cal-week-rows']: calendarWeeks.length,
+          }}
+        >
+          {calendarWeeks.map((weekCells, wi) => (
+            <CalWeekRow
+              key={`week-${wi}-${year}-${month}`}
+              weekCells={weekCells}
+              monthIsoPad={monthIsoPad}
+              year={year}
+              agent={agent}
+              schedules={schedules}
+              highlightedDayNum={highlightedDay}
+              dropOnDate={(dateStr, raw) => onDrop(dateStr, raw)}
+              removeScheduledVisit={removeScheduledVisit}
+              calendarFilterAcc={calendarFilterAcc}
+              calendarChipRoundFilter={calendarChipRoundFilter}
+              onDayDoubleClick={(dateStr) => {
+                if (!agent) return;
+                setCalendarDayDetailDateStr(dateStr);
+              }}
+            />
+          ))}
+        </div>
       </div>
     </div>
   );
@@ -2694,97 +2944,223 @@ function App() {
           :root {
             color-scheme: light !important;
           }
+          @page {
+            margin: 5mm;
+            size: A4 portrait;
+          }
+          @page cal-sheet {
+            margin: 5mm;
+            size: A4 landscape;
+          }
           html, body, #root {
-            height: auto !important;
-            max-height: none !important;
-            overflow: visible !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            width: 100% !important;
+            height: 100% !important;
             background: white !important;
+            overflow: hidden !important;
           }
           body {
             color: #0f172a !important;
           }
           #root {
             display: block !important;
-            width: 100% !important;
             min-height: 0 !important;
             flex: none !important;
           }
-          @page { margin: 6mm; size: landscape; }
+          .cal-print-sheet {
+            page: cal-sheet;
+            position: fixed !important;
+            top: 0 !important;
+            left: 0 !important;
+            right: 0 !important;
+            bottom: 0 !important;
+            width: 100% !important;
+            height: 100% !important;
+            display: flex !important;
+            flex-direction: column !important;
+            box-sizing: border-box !important;
+            overflow: hidden !important;
+            background: white !important;
+            page-break-after: avoid !important;
+            page-break-inside: avoid !important;
+            z-index: 99999 !important;
+          }
+          .cal-print-sheet .cal-calendar-body {
+            flex: 1 1 auto !important;
+            min-height: 0 !important;
+            height: 100% !important;
+            width: 100% !important;
+            display: flex !important;
+            flex-direction: column !important;
+            box-sizing: border-box !important;
+          }
+          .cal-calendar-print-header {
+            display: block !important;
+            flex-shrink: 0 !important;
+            margin: 0 0 1.5mm 0 !important;
+            padding: 0 1mm !important;
+            font-size: 9pt !important;
+            font-weight: 700 !important;
+            color: #0f172a !important;
+            line-height: 1.2 !important;
+          }
+          .cal-print-sheet .cal-weekday-header {
+            flex-shrink: 0 !important;
+            display: grid !important;
+            grid-template-columns: repeat(7, 1fr) !important;
+            width: 100% !important;
+            min-width: 0 !important;
+            box-sizing: border-box !important;
+            border: 1px solid #cbd5e1 !important;
+            border-bottom: none !important;
+            background: #f1f5f9 !important;
+          }
+          .cal-print-sheet .cal-weekday-header > div {
+            padding: 1.2mm 0 !important;
+            text-align: center !important;
+            font-size: 7.5pt !important;
+            font-weight: 700 !important;
+            border-right: 1px solid #e2e8f0 !important;
+            box-sizing: border-box !important;
+          }
+          .cal-print-sheet .cal-weeks-stack {
+            flex: 1 1 auto !important;
+            min-height: 0 !important;
+            display: grid !important;
+            grid-template-rows: repeat(var(--cal-week-rows, 6), minmax(0, 1fr)) !important;
+            width: 100% !important;
+            min-width: 0 !important;
+            box-sizing: border-box !important;
+            gap: 0 !important;
+            border: 1px solid #cbd5e1 !important;
+            border-top: none !important;
+          }
+          .cal-week-block {
+            width: 100% !important;
+            min-height: 0 !important;
+            height: 100% !important;
+            box-sizing: border-box !important;
+            break-inside: avoid !important;
+            page-break-inside: avoid !important;
+          }
           .app-root-shell {
             display: block !important;
             width: 100% !important;
-            height: auto !important;
-            min-height: 0 !important;
-            max-height: none !important;
-            overflow: visible !important;
             background: white !important;
           }
           .main-column {
             display: block !important;
-            height: auto !important;
-            overflow: visible !important;
             background: white !important;
           }
           .main-scroll-region {
             padding: 0 !important;
-            overflow: visible !important;
-            height: auto !important;
-            max-height: none !important;
             flex: none !important;
-            min-height: 0 !important;
           }
           .content-white-panel {
-            overflow: visible !important;
-            height: auto !important;
-            max-height: none !important;
-            flex: none !important;
             border: none !important;
+            flex: none !important;
           }
           .schedule-strip-print {
             display: none !important;
           }
-          .cal-calendar-body {
+          body.print-summary-view .summary-print-wrap:not(.summary-print-empty) {
+            position: fixed !important;
+            top: 0 !important;
+            left: 0 !important;
+            right: 0 !important;
+            bottom: 0 !important;
             width: 100% !important;
-            break-inside: avoid;
-            page-break-inside: avoid;
+            height: 100% !important;
+            overflow: hidden !important;
+            box-sizing: border-box !important;
+            page-break-after: avoid !important;
+            page-break-inside: avoid !important;
             transform-origin: top left;
-          }
-          .cal-calendar-print-header {
-            display: block !important;
-            margin: 0 0 4px 0;
-            padding: 0 2px;
-            font-size: 9pt;
-            font-weight: 700;
-            color: #0f172a;
-          }
-          .cal-calendar-body > .cal-weeks-stack,
-          .cal-weeks-stack {
-            width: 100% !important;
-            min-width: 0 !important;
-          }
-          .cal-week-block {
-            width: 100% !important;
-            box-sizing: border-box;
-            break-inside: avoid;
-            page-break-inside: avoid;
+            z-index: 99999 !important;
+            background: white !important;
           }
           .cal-week-row {
             width: 100% !important;
+            height: 100% !important;
+            min-height: 0 !important;
+            display: grid !important;
+            grid-template-columns: repeat(7, 1fr) !important;
+            align-items: stretch !important;
           }
           .cal-day-cell,
           .cal-pad-cell {
             min-height: 0 !important;
-            height: auto !important;
+            height: 100% !important;
+            overflow: hidden !important;
+            box-sizing: border-box !important;
           }
           .cal-day-cell {
-            padding: 3px !important;
+            padding: 0.8mm !important;
+            display: flex !important;
+            flex-direction: row !important;
+            align-items: flex-start !important;
+            gap: 0.8mm !important;
           }
-          .cal-day-cell b {
+          .cal-day-cell > b {
+            flex: 0 0 auto !important;
+            width: 5mm !important;
+            min-width: 5mm !important;
             font-size: 8pt !important;
+            line-height: 1.1 !important;
+            text-align: left !important;
+            padding-top: 0.2mm !important;
           }
           .cal-day-tasks {
-            max-height: none !important;
-            overflow: visible !important;
+            flex: 1 1 auto !important;
+            min-width: 0 !important;
+            min-height: 0 !important;
+            margin-top: 0 !important;
+            gap: 0.15mm !important;
+            display: flex !important;
+            flex-direction: column !important;
+            overflow: hidden !important;
+          }
+          .cal-day-tasks > div,
+          .cal-day-tasks .cal-day-task-chip {
+            flex: 0 0 auto !important;
+            width: 100% !important;
+            min-height: 0 !important;
+            height: auto !important;
+            padding: 0 !important;
+            border-radius: 0 !important;
+            gap: 0.3mm !important;
+            background: transparent !important;
+            border: none !important;
+            box-shadow: none !important;
+            color: var(--visit-round-color, #1e293b) !important;
+            display: flex !important;
+            align-items: center !important;
+          }
+          .cal-day-tasks .cal-day-task-chip span[aria-hidden] {
+            flex-shrink: 0 !important;
+            min-width: 0 !important;
+            min-height: 0 !important;
+            height: auto !important;
+            padding: 0 0.3mm 0 0 !important;
+            background: transparent !important;
+            font-weight: 800 !important;
+          }
+          .cal-day-tasks [data-cal-chip-text] {
+            flex: 1 1 auto !important;
+            min-width: 0 !important;
+            font-size: var(--cal-print-font-size, 5pt) !important;
+            line-height: var(--cal-print-line-height, 1.05) !important;
+            color: var(--visit-round-color, #1e293b) !important;
+            font-weight: 700 !important;
+            white-space: nowrap !important;
+            overflow: hidden !important;
+            text-overflow: ellipsis !important;
+          }
+          .cal-day-tasks span[aria-hidden] {
+            font-size: var(--cal-print-num-font-size, 4.5pt) !important;
+            line-height: var(--cal-print-line-height, 1.05) !important;
+            color: var(--visit-round-color, #1e293b) !important;
           }
           .summary-print-wrap {
             overflow: visible !important;
@@ -2908,6 +3284,15 @@ function App() {
         .cal-day-tasks {
           scrollbar-width: thin;
           scrollbar-color: rgba(100, 116, 139, 0.55) rgba(241, 245, 249, 0.9);
+          align-items: stretch;
+        }
+        .cal-day-cell {
+          min-width: 0;
+        }
+        .cal-day-task-chip {
+          width: 100%;
+          max-width: 100%;
+          align-self: stretch;
         }
         .content-white-panel::-webkit-scrollbar {
           width: 8px;
@@ -3757,8 +4142,8 @@ function App() {
           </div>
           <button
             type="button"
-            onClick={() => window.print()}
-            title="Print or save as PDF: the current view (Calendar or Summary) fits on one landscape page."
+            onClick={handlePrintPdf}
+            title="Print or save as PDF: Calendar fits one landscape page; Summary fits one portrait page."
             style={{ background: '#2563eb', color: 'white', border: 'none', padding: '10px 25px', borderRadius: '8px', cursor: 'pointer', fontWeight:'bold' }}
           >
             PRINT / PDF
