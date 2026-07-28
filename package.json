@@ -1,12 +1,13 @@
 {
   "name": "route-planner",
   "private": true,
-  "version": "1.1.12",
+  "version": "1.1.13",
   "description": "Sales route planner — import customers, drag visits onto the calendar.",
   "author": "JackyPhua",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
+    "start": "npm run electron:run",
     "dev": "vite",
     "build": "vite build",
     "build:electron": "vite build --mode electron",

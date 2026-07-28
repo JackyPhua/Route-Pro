@@ -562,26 +562,6 @@ function monthWeekSlots(firstDay, totalDays) {
   return weeks;
 }
 
-/** Sunday (local) ISO yyyy-mm-dd for the week containing dateStr — used for print week pages */
-function sundayIsoOfContainingWeek(dateStr) {
-  const parts = String(dateStr).split('-').map(Number);
-  if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n))) return dateStr;
-  const [y, m, d] = parts;
-  const dt = new Date(y, m - 1, d);
-  if (dt.getFullYear() !== y || dt.getMonth() !== m - 1 || dt.getDate() !== d) return dateStr;
-  dt.setDate(dt.getDate() - dt.getDay());
-  return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`;
-}
-
-/** Print label for a week row’s in-month day span, e.g. "5–11" or "28–31" */
-function weekInMonthDaySpanLabel(weekCells) {
-  const days = weekCells.filter((s) => s.kind === 'day').map((s) => s.dayNum);
-  if (days.length === 0) return '';
-  const lo = Math.min(...days);
-  const hi = Math.max(...days);
-  return lo === hi ? String(lo) : `${lo}–${hi}`;
-}
-
 /** 一周内所有拜访条共用同一字号（整排行同步缩放）；宽度取自该行任一条的文字区（各列等宽） */
 function CalWeekRow({
   weekCells,
@@ -595,13 +575,9 @@ function CalWeekRow({
   calendarFilterAcc,
   calendarChipRoundFilter,
   onDayDoubleClick,
-  monthLabel,
-  companyName,
-  isLastWeek,
 }) {
   const rowHostRef = useRef(null);
   const [rowFontPx, setRowFontPx] = useState(CAL_CHIP_FONT_MAX);
-  const daySpan = weekInMonthDaySpanLabel(weekCells);
 
   const enriched = useMemo(
     () =>
@@ -718,25 +694,7 @@ function CalWeekRow({
   }, [rowTaskCount, rowTaskKey, enriched]);
 
   return (
-    <div
-      className={`cal-week-block${isLastWeek ? ' cal-week-block--last' : ''}`}
-      style={{ width: '100%', boxSizing: 'border-box' }}
-    >
-      <div className="cal-week-print-banner">
-        <span>
-          {companyName?.trim() ? `${companyName.trim()} · ` : ''}
-          {agent || 'NOT SELECTED'}
-          {' · '}
-          {monthLabel}
-          {daySpan ? ` · days ${daySpan}` : ''}
-        </span>
-        <span>One week / page</span>
-      </div>
-      <div className="cal-week-print-weekdays">
-        {WEEKDAY_ABBREV_SUN0.map((label) => (
-          <div key={label}>{label}</div>
-        ))}
-      </div>
+    <div className="cal-week-block" style={{ width: '100%', boxSizing: 'border-box' }}>
       <div
         ref={rowHostRef}
         className="cal-week-row"
@@ -1880,6 +1838,47 @@ function App() {
     document.title = companyName.trim() ? `${companyName.trim()} — ${base}` : base;
   }, [companyName]);
 
+  useEffect(() => {
+    const PRINT_SCALE_SELECTORS = '.summary-print-wrap, .cal-calendar-body';
+
+    const resetPrintScale = () => {
+      document.querySelectorAll(PRINT_SCALE_SELECTORS).forEach((el) => {
+        el.style.transform = '';
+        el.style.width = '';
+        el.style.marginBottom = '';
+      });
+    };
+
+    const fitElementToOneLandscapePage = (el, minScale = 0.35) => {
+      const maxH = ((210 - 12) * 96) / 25.4;
+      const h = el.scrollHeight;
+      if (h <= maxH) return;
+      const scale = Math.max(minScale, maxH / h);
+      el.style.transform = `scale(${scale})`;
+      el.style.width = `${100 / scale}%`;
+      el.style.marginBottom = `${-(h * (1 - scale))}px`;
+    };
+
+    /** Scale active print view to one landscape sheet when content overflows */
+    const fitPrintToOnePage = () => {
+      resetPrintScale();
+      const summary = document.querySelector('.summary-print-wrap:not(.summary-print-empty)');
+      if (summary) {
+        fitElementToOneLandscapePage(summary);
+        return;
+      }
+      const calendar = document.querySelector('.cal-calendar-body');
+      if (calendar) fitElementToOneLandscapePage(calendar, 0.22);
+    };
+
+    window.addEventListener('beforeprint', fitPrintToOnePage);
+    window.addEventListener('afterprint', resetPrintScale);
+    return () => {
+      window.removeEventListener('beforeprint', fitPrintToOnePage);
+      window.removeEventListener('afterprint', resetPrintScale);
+    };
+  }, []);
+
   const dismissSettingsDialog = useCallback(() => {
     setSettingsDialogOpen(false);
     setSettingsDraftCompanyName('');
@@ -2033,14 +2032,14 @@ function App() {
   const renderSummary = () => {
     if (!agent) {
       return (
-        <div className="summary-print-wrap" style={{ padding: '24px', color: '#64748b', flex: 1 }}>
+        <div className="summary-print-wrap summary-print-empty" style={{ padding: '24px', color: '#64748b', flex: 1 }}>
           Choose a sales agent to see visits scheduled for this month.
         </div>
       );
     }
     if (!summarySections || summarySections.totalVisits === 0) {
       return (
-        <div className="summary-print-wrap" style={{ padding: '24px', color: '#64748b', flex: 1 }}>
+        <div className="summary-print-wrap summary-print-empty" style={{ padding: '24px', color: '#64748b', flex: 1 }}>
           No visits on the calendar for <strong style={{ color: '#1e293b' }}>{agent}</strong> in {monthLabel}. Drag customers from the sidebar onto dates in Calendar.
         </div>
       );
@@ -2050,7 +2049,7 @@ function App() {
     const filtered = summaryFiltered;
     if (!filtered || filtered.totalVisits === 0) {
       return (
-        <div className="summary-print-wrap" style={{ padding: '24px', color: '#64748b', flex: 1, lineHeight: 1.5 }}>
+        <div className="summary-print-wrap summary-print-empty" style={{ padding: '24px', color: '#64748b', flex: 1, lineHeight: 1.5 }}>
           No visits between <strong style={{ color: '#1e293b' }}>day {from}</strong> and{' '}
           <strong style={{ color: '#1e293b' }}>day {to}</strong> for{' '}
           <strong style={{ color: '#1e293b' }}>{agent}</strong> in {monthLabel}. Expand the Summary range above or schedule visits on those dates in Calendar.
@@ -2062,40 +2061,6 @@ function App() {
     const cell = { padding: '10px 12px', borderBottom: '1px solid #e2e8f0', fontSize: '13px' };
     const summaryRangeTitle =
       from === 1 && to === daysInMonth ? monthLabel : `${monthLabel}, days ${from}–${to}`;
-
-    /** Group scheduled days into Sun–Sat weeks for one-week-per-page print */
-    const weekBuckets = [];
-    const weekIndexBySunday = new Map();
-    dateKeys.forEach((dateStr) => {
-      const sun = sundayIsoOfContainingWeek(dateStr);
-      let idx = weekIndexBySunday.get(sun);
-      if (idx == null) {
-        idx = weekBuckets.length;
-        weekIndexBySunday.set(sun, idx);
-        weekBuckets.push({ sundayIso: sun, dateKeys: [] });
-      }
-      weekBuckets[idx].dateKeys.push(dateStr);
-    });
-
-    const renderVisitRows = (keys) =>
-      keys.flatMap((dateStr) =>
-        byDate[dateStr].map((row, idx) => {
-          const d = row.weekday ?? weekdayAbbrevFromIso(dateStr);
-          const dayNum = Number(dateStr.slice(-2));
-          const showingDate = idx === 0;
-          return (
-            <tr key={`${dateStr}-${row.acc}-${idx}`} style={{ background: 'white' }}>
-              <td style={{ ...cell, color: '#0f172a', fontWeight: showingDate ? 600 : 400, verticalAlign: 'top', whiteSpace: 'nowrap' }}>
-                {showingDate ? `${d} ${dayNum}` : ''}
-              </td>
-              <td style={{ ...cell, color: '#475569', fontWeight: 600, verticalAlign: 'top' }}>{normalizeVisitRound(row.visitRound)}</td>
-              <td style={{ ...cell, color: '#334155', verticalAlign: 'top' }}>{row.acc}</td>
-              <td style={{ ...cell, color: '#1e293b', verticalAlign: 'top' }}>{row.name}</td>
-              <td style={{ ...cell, color: '#64748b', verticalAlign: 'top' }}>{row.area}</td>
-            </tr>
-          );
-        }),
-      );
 
     return (
       <div
@@ -2111,7 +2076,7 @@ function App() {
           gap: '20px',
         }}
       >
-        <div className="summary-print-page-title no-print">
+        <div className="summary-print-page-title">
           {companyName.trim() ? (
             <span className="app-company-display">{companyName.trim()}</span>
           ) : null}
@@ -2120,7 +2085,7 @@ function App() {
             {agent ? ` · ${agent}` : ''}
           </span>
         </div>
-        <div className="summary-print-kpi-row no-print" style={{ display: 'flex', gap: '16px', flexWrap: 'wrap' }}>
+        <div className="summary-print-kpi-row" style={{ display: 'flex', gap: '16px', flexWrap: 'wrap' }}>
           {[
             { label: 'Total visits', value: totalVisits },
             { label: 'Customers', value: uniqueCustomers },
@@ -2128,6 +2093,7 @@ function App() {
           ].map((kpi) => (
             <div
               key={kpi.label}
+              className="summary-print-kpi"
               style={{
                 flex: '1 1 120px',
                 minWidth: '100px',
@@ -2137,14 +2103,13 @@ function App() {
                 padding: '14px 16px',
               }}
             >
-              <div style={{ fontSize: '11px', textTransform: 'uppercase', color: '#64748b', marginBottom: '4px' }}>{kpi.label}</div>
-              <div style={{ fontSize: '22px', fontWeight: '700', color: '#1e293b' }}>{kpi.value}</div>
+              <div className="summary-print-kpi-label" style={{ fontSize: '11px', textTransform: 'uppercase', color: '#64748b', marginBottom: '4px' }}>{kpi.label}</div>
+              <div className="summary-print-kpi-value" style={{ fontSize: '22px', fontWeight: '700', color: '#1e293b' }}>{kpi.value}</div>
             </div>
           ))}
         </div>
 
-        {/* Screen: single continuous table */}
-        <div className="summary-print-table-host no-print" style={{ border: '1px solid #e2e8f0', borderRadius: '8px', overflow: 'hidden', background: 'white' }}>
+        <div className="summary-print-table-host" style={{ border: '1px solid #e2e8f0', borderRadius: '8px', overflow: 'hidden', background: 'white' }}>
           <table className="summary-print-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
             <thead>
               <tr style={{ background: '#1e293b', color: 'white', textAlign: 'left', fontSize: '12px' }}>
@@ -2155,50 +2120,27 @@ function App() {
                 <th style={{ ...cell, fontWeight: 600 }}>Area</th>
               </tr>
             </thead>
-            <tbody>{renderVisitRows(dateKeys)}</tbody>
+            <tbody>
+              {dateKeys.flatMap((dateStr) =>
+                byDate[dateStr].map((row, idx) => {
+                  const d = row.weekday ?? weekdayAbbrevFromIso(dateStr);
+                  const dayNum = Number(dateStr.slice(-2));
+                  const showingDate = idx === 0;
+                  return (
+                    <tr key={`${dateStr}-${row.acc}-${idx}`} style={{ background: 'white' }}>
+                      <td style={{ ...cell, color: '#0f172a', fontWeight: showingDate ? 600 : 400, verticalAlign: 'top', whiteSpace: 'nowrap' }}>
+                        {showingDate ? `${d} ${dayNum}` : ''}
+                      </td>
+                      <td style={{ ...cell, color: '#475569', fontWeight: 600, verticalAlign: 'top' }}>{normalizeVisitRound(row.visitRound)}</td>
+                      <td style={{ ...cell, color: '#334155', verticalAlign: 'top' }}>{row.acc}</td>
+                      <td style={{ ...cell, color: '#1e293b', verticalAlign: 'top' }}>{row.name}</td>
+                      <td style={{ ...cell, color: '#64748b', verticalAlign: 'top' }}>{row.area}</td>
+                    </tr>
+                  );
+                }),
+              )}
+            </tbody>
           </table>
-        </div>
-
-        {/* Print/PDF: one week per sheet */}
-        <div className="summary-print-weeks">
-          {weekBuckets.map((week, wi) => {
-            const dayNums = week.dateKeys.map((d) => Number(d.slice(-2))).filter(Number.isFinite);
-            const lo = dayNums.length ? Math.min(...dayNums) : null;
-            const hi = dayNums.length ? Math.max(...dayNums) : null;
-            const span = lo == null ? '' : lo === hi ? `day ${lo}` : `days ${lo}–${hi}`;
-            const isLast = wi === weekBuckets.length - 1;
-            return (
-              <div
-                key={week.sundayIso}
-                className={`summary-week-page${isLast ? ' summary-week-page--last' : ''}`}
-              >
-                <div className="summary-print-page-title summary-week-page-title">
-                  {companyName.trim() ? (
-                    <span className="app-company-display">{companyName.trim()}</span>
-                  ) : null}
-                  <span className="summary-print-page-title-meta">
-                    Schedule summary · {monthLabel}
-                    {span ? ` · ${span}` : ''}
-                    {agent ? ` · ${agent}` : ''}
-                  </span>
-                </div>
-                <div className="summary-print-table-host" style={{ border: '1px solid #e2e8f0', borderRadius: '8px', overflow: 'hidden', background: 'white' }}>
-                  <table className="summary-print-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
-                    <thead>
-                      <tr style={{ background: '#1e293b', color: 'white', textAlign: 'left', fontSize: '12px' }}>
-                        <th style={{ ...cell, fontWeight: 600 }}>Date</th>
-                        <th style={{ ...cell, fontWeight: 600 }}>#</th>
-                        <th style={{ ...cell, fontWeight: 600 }}>Account</th>
-                        <th style={{ ...cell, fontWeight: 600 }}>Customer</th>
-                        <th style={{ ...cell, fontWeight: 600 }}>Area</th>
-                      </tr>
-                    </thead>
-                    <tbody>{renderVisitRows(week.dateKeys)}</tbody>
-                  </table>
-                </div>
-              </div>
-            );
-          })}
         </div>
       </div>
     );
@@ -2674,8 +2616,14 @@ function App() {
 
   const renderCalendar = () => (
     <div className="cal-calendar-body" style={{ width: '100%', minWidth: 0, flex: '1 1 auto', minHeight: 0 }}>
+      <div className="cal-calendar-print-header">
+        <span>
+          {companyName.trim() ? `${companyName.trim()} · ` : ''}
+          {agent || 'NOT SELECTED'} · {monthLabel}
+        </span>
+      </div>
       <div
-        className="cal-weekday-header no-print"
+        className="cal-weekday-header"
         style={{
           display: 'grid',
           gridTemplateColumns: 'repeat(7, 1fr)',
@@ -2727,9 +2675,6 @@ function App() {
             removeScheduledVisit={removeScheduledVisit}
             calendarFilterAcc={calendarFilterAcc}
             calendarChipRoundFilter={calendarChipRoundFilter}
-            monthLabel={monthLabel}
-            companyName={companyName}
-            isLastWeek={wi === calendarWeeks.length - 1}
             onDayDoubleClick={(dateStr) => {
               if (!agent) return;
               setCalendarDayDetailDateStr(dateStr);
@@ -2764,7 +2709,7 @@ function App() {
             min-height: 0 !important;
             flex: none !important;
           }
-          @page { margin: 10mm; size: landscape; }
+          @page { margin: 6mm; size: landscape; }
           .app-root-shell {
             display: block !important;
             width: 100% !important;
@@ -2800,75 +2745,42 @@ function App() {
           }
           .cal-calendar-body {
             width: 100% !important;
+            break-inside: avoid;
+            page-break-inside: avoid;
+            transform-origin: top left;
+          }
+          .cal-calendar-print-header {
+            display: block !important;
+            margin: 0 0 4px 0;
+            padding: 0 2px;
+            font-size: 9pt;
+            font-weight: 700;
+            color: #0f172a;
           }
           .cal-calendar-body > .cal-weeks-stack,
           .cal-weeks-stack {
             width: 100% !important;
             min-width: 0 !important;
           }
-          .cal-week-print-banner {
-            display: flex !important;
-            justify-content: space-between;
-            align-items: baseline;
-            gap: 12px;
-            margin: 0 0 6px 0;
-            padding: 0 2px;
-            font-size: 10pt;
-            font-weight: 700;
-            color: #0f172a;
-          }
-          .cal-week-print-banner span:last-child {
-            font-size: 8pt;
-            font-weight: 600;
-            color: #64748b;
-            text-transform: uppercase;
-            letter-spacing: 0.04em;
-          }
-          .cal-week-print-weekdays {
-            display: grid !important;
-            grid-template-columns: repeat(7, 1fr);
-            width: 100%;
-            box-sizing: border-box;
-            background: #e2e8f0;
-            border: 1px solid #cbd5e1;
-            border-bottom: none;
-          }
-          .cal-week-print-weekdays > div {
-            padding: 4px 2px;
-            text-align: center;
-            font-size: 8pt;
-            font-weight: 700;
-            letter-spacing: 0.03em;
-            text-transform: uppercase;
-            color: #334155;
-            border-right: 1px solid #cbd5e1;
-            box-sizing: border-box;
-          }
-          .cal-week-print-weekdays > div:first-child {
-            color: #e11d48;
-          }
           .cal-week-block {
-            break-after: page;
-            page-break-after: always;
-            break-inside: avoid;
-            page-break-inside: avoid;
             width: 100% !important;
             box-sizing: border-box;
-          }
-          .cal-week-block--last {
-            break-after: auto;
-            page-break-after: auto;
+            break-inside: avoid;
+            page-break-inside: avoid;
           }
           .cal-week-row {
             width: 100% !important;
           }
           .cal-day-cell,
           .cal-pad-cell {
-            min-height: 68mm !important;
-            height: 68mm !important;
+            min-height: 0 !important;
+            height: auto !important;
           }
           .cal-day-cell {
-            padding: 6px !important;
+            padding: 3px !important;
+          }
+          .cal-day-cell b {
+            font-size: 8pt !important;
           }
           .cal-day-tasks {
             max-height: none !important;
@@ -2881,52 +2793,60 @@ function App() {
             display: block !important;
             flex: none !important;
             gap: 0 !important;
-          }
-          .summary-print-weeks {
-            display: block !important;
-          }
-          .summary-week-page {
-            break-after: page;
-            page-break-after: always;
             break-inside: avoid;
             page-break-inside: avoid;
-            padding: 4px 0 8px;
+            transform-origin: top left;
           }
-          .summary-week-page--last {
-            break-after: auto;
-            page-break-after: auto;
-          }
-          .summary-week-page-title {
+          .summary-print-page-title {
             display: block !important;
-            margin: 0 0 10px 0 !important;
+            margin: 0 0 6px 0 !important;
             padding: 0 !important;
           }
           .summary-print-page-title .app-company-display {
             display: block !important;
-            font-size: 16pt !important;
-            margin-bottom: 4px !important;
+            font-size: 11pt !important;
+            margin-bottom: 2px !important;
             color: #0f172a !important;
             -webkit-text-fill-color: #0f172a !important;
             background: none !important;
           }
           .summary-print-page-title-meta {
             display: block !important;
-            font-size: 10pt !important;
+            font-size: 8pt !important;
             font-weight: 600 !important;
             color: #475569 !important;
             letter-spacing: 0.04em !important;
             text-transform: uppercase !important;
           }
+          .summary-print-kpi-row {
+            display: flex !important;
+            flex-wrap: nowrap !important;
+            gap: 8px !important;
+            margin-bottom: 6px !important;
+          }
+          .summary-print-kpi {
+            flex: 1 1 auto !important;
+            min-width: 0 !important;
+            padding: 4px 8px !important;
+            border-radius: 4px !important;
+          }
+          .summary-print-kpi-label {
+            font-size: 6pt !important;
+            margin-bottom: 1px !important;
+          }
+          .summary-print-kpi-value {
+            font-size: 10pt !important;
+          }
           .summary-print-table-host {
             overflow: visible !important;
             border-radius: 0 !important;
           }
-          .summary-print-kpi-row > * {
-            break-inside: avoid;
-            page-break-inside: avoid;
-          }
           .summary-print-table {
-            font-size: 10pt !important;
+            font-size: 7pt !important;
+          }
+          .summary-print-table th,
+          .summary-print-table td {
+            padding: 2px 4px !important;
           }
           .summary-print-table thead {
             display: table-header-group;
@@ -2936,12 +2856,7 @@ function App() {
             page-break-inside: avoid;
           }
         }
-        .summary-print-page-title {
-          display: none;
-        }
-        .cal-week-print-banner,
-        .cal-week-print-weekdays,
-        .summary-print-weeks {
+        .cal-calendar-print-header {
           display: none;
         }
         .import-sr-only {
@@ -3843,7 +3758,7 @@ function App() {
           <button
             type="button"
             onClick={() => window.print()}
-            title="Print or save as PDF: one calendar week (Sun–Sat) per page. Use Summary for a visit list, also one week per page."
+            title="Print or save as PDF: the current view (Calendar or Summary) fits on one landscape page."
             style={{ background: '#2563eb', color: 'white', border: 'none', padding: '10px 25px', borderRadius: '8px', cursor: 'pointer', fontWeight:'bold' }}
           >
             PRINT / PDF
