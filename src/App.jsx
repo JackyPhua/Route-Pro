@@ -192,14 +192,21 @@ function computeRowChipMetrics(maxTaskCount, availHeight, textWidth, tasks, meas
   };
 }
 
-const PRINT_SCALE_SELECTORS = '.summary-print-wrap, .cal-print-sheet';
+const PRINT_SCALE_SELECTORS = '.summary-print-wrap, .summary-print-page, .cal-print-sheet';
 
-function printLandscapeCellMetrics() {
+function printPageCellMetrics(orientation = 'portrait') {
   const weekCount = Math.max(1, document.querySelectorAll('.cal-week-block').length);
+  const pageMarginMm = 10; // @page margin 5mm per side
+  const headerMm = 12; // month title + weekday header row
+  const pageW = orientation === 'portrait' ? 210 : 297;
+  const pageH = orientation === 'portrait' ? 297 : 210;
+  const usableW = pageW - pageMarginMm;
+  const usableH = pageH - pageMarginMm - headerMm;
   return {
     weekCount,
-    cellH: (((200 - 14) * 96) / 25.4) / weekCount,
-    cellW: (((287 - 4) * 96) / 25.4) / 7,
+    orientation,
+    cellH: ((usableH * 96) / 25.4) / weekCount,
+    cellW: ((usableW * 96) / 25.4) / 7,
   };
 }
 
@@ -208,6 +215,11 @@ function resetCalendarPrintFonts() {
     el.style.removeProperty('--cal-print-font-size');
     el.style.removeProperty('--cal-print-num-font-size');
     el.style.removeProperty('--cal-print-line-height');
+    el.style.removeProperty('--cal-print-slot-h');
+    el.style.removeProperty('--cal-print-gap');
+    el.style.removeProperty('gap');
+    el.style.removeProperty('height');
+    el.style.removeProperty('flex');
   });
   document.querySelectorAll('.cal-day-task-chip [data-cal-chip-text], .cal-day-task-chip span[aria-hidden]').forEach((el) => {
     if (el instanceof HTMLElement) {
@@ -215,10 +227,30 @@ function resetCalendarPrintFonts() {
       el.style.removeProperty('line-height');
     }
   });
+  document.querySelectorAll('.cal-day-task-chip span[aria-hidden]').forEach((el) => {
+    if (el instanceof HTMLElement) {
+      el.style.removeProperty('width');
+      el.style.removeProperty('min-width');
+      el.style.removeProperty('height');
+    }
+  });
+  // Restore the on-screen single-line ellipsis look that print-fit overrode
+  document.querySelectorAll('.cal-day-task-chip [data-cal-chip-text]').forEach((el) => {
+    if (el instanceof HTMLElement) {
+      el.style.removeProperty('overflow-wrap');
+      el.style.setProperty('white-space', 'nowrap');
+      el.style.setProperty('text-overflow', 'ellipsis');
+    }
+  });
   document.querySelectorAll('.cal-day-task-chip').forEach((el) => {
     if (el instanceof HTMLElement) {
       el.style.removeProperty('min-height');
+      el.style.removeProperty('max-height');
+      el.style.removeProperty('height');
+      el.style.removeProperty('flex');
       el.style.removeProperty('padding');
+      el.style.removeProperty('gap');
+      el.style.removeProperty('align-items');
     }
   });
 }
@@ -235,80 +267,174 @@ function resetPrintScale() {
   resetCalendarPrintFonts();
 }
 
-/** Shrink print font per day cell so every scheduled customer line fits (compact rows) */
-function fitCalendarPrintCellFonts() {
+/** Print auto-fit sizes are computed from the real A4 paper size (not the on-screen window). */
+const CAL_PRINT_FONT_MAX = 12; // ≈9pt on paper
+const CAL_PRINT_FONT_MIN = 4;
+const CAL_PRINT_LINE_H = 1.06;
+
+const PRINT_FIT_VERSION = 'print-fit v7 · uniform-global · true-text-width';
+
+/* Print chip geometry: the on-screen chip keeps inline width:20px on the
+ * round badge and gap:4px, which the print CSS never overrode — so on paper
+ * the name column was ~15% narrower than the fit math assumed and long names
+ * wrapped one line more than measured, clipping dense days. In print we force
+ * these compact values AND use the same numbers in the width math. */
+const CAL_PRINT_BADGE_W = 8;
+const CAL_PRINT_CHIP_GAP = 1.5;
+
+/**
+ * Measure total height of all names in one cell at a candidate font size.
+ * Names may wrap to AT MOST 2 lines; returns Infinity when any name needs more.
+ */
+function measureCellTextHeight(measureEl, texts, w, fontPx) {
+  measureEl.style.width = `${Math.max(12, w)}px`;
+  measureEl.style.fontSize = `${fontPx}px`;
+  const maxNameH = 2 * fontPx * CAL_PRINT_LINE_H + 2;
+  let total = 0;
+  for (const text of texts) {
+    measureEl.textContent = text;
+    const h = measureEl.scrollHeight;
+    if (h > maxNameH) return Infinity;
+    total += h;
+  }
+  return total;
+}
+
+/**
+ * Per-day cell auto-fit from A4 paper metrics (window size irrelevant).
+ * ONE font size per cell (tidy), as large as fits: every name ≤2 wrapped
+ * lines and the stack of natural-height rows fits the cell height.
+ * Rows keep natural height (no stretching), leftover space becomes even gaps.
+ */
+function fitCalendarPrintCellFonts(orientation = 'portrait') {
   const measureEl = document.createElement('span');
   measureEl.style.cssText = [
     'position:absolute',
     'left:-99999px',
     'top:0',
     'visibility:hidden',
-    'white-space:nowrap',
+    'display:block',
+    'white-space:normal',
+    'overflow-wrap:break-word',
+    `line-height:${CAL_PRINT_LINE_H}`,
     'font-family:system-ui,-apple-system,"Segoe UI",sans-serif',
     'font-weight:700',
   ].join(';');
   document.body.appendChild(measureEl);
 
-  try {
-    const { cellH: fallbackCellH, cellW: fallbackCellW } = printLandscapeCellMetrics();
+  const cellStats = [];
 
+  try {
+    const paper = printPageCellMetrics(orientation);
+    const labelW = 11.4; // 3mm printed date column
+    const cellChromeW = 6; // 0.4mm cell padding ×2 + 0.2mm gap + 1px borders ×2
+    const safetyW = 3; // absorbs badge right-padding + subpixel wrap rounding
+    const textW = Math.max(
+      14,
+      paper.cellW - labelW - cellChromeW - CAL_PRINT_BADGE_W - CAL_PRINT_CHIP_GAP - safetyW,
+    );
+    const availH = Math.max(12, paper.cellH - 5);
+
+    // Pass 1: fitted font size per cell (largest where every name ≤2 lines
+    // and the row stack fits the cell height).
+    const fittedCells = [];
     document.querySelectorAll('.cal-day-cell').forEach((cell) => {
       const tasksCol = cell.querySelector('.cal-day-tasks');
       if (!tasksCol) return;
-      const chips = tasksCol.querySelectorAll('.cal-day-task-chip');
+      const chips = [...tasksCol.querySelectorAll('.cal-day-task-chip')];
       const n = chips.length;
       if (n === 0) return;
 
-      tasksCol.setAttribute('data-task-count', String(n));
+      const texts = chips.map(
+        (chip) => chip.querySelector('[data-cal-chip-text]')?.textContent ?? '',
+      );
+      const minGap = n > 14 ? 0.4 : n > 8 ? 0.6 : 1;
 
-      const cellH = fallbackCellH;
-      const cellW = fallbackCellW;
-      const textW = Math.max(16, cellW - 18);
-      const availH = Math.max(8, cellH - 4);
-      const gapPx = n > 1 ? 0.8 : 0;
-
-      let fontPx = Math.min(7.5, (availH - gapPx * (n - 1)) / n * 0.9);
-      fontPx = Math.max(2.8, fontPx);
-
-      chips.forEach((chip) => {
-        const textEl = chip.querySelector('[data-cal-chip-text]');
-        const text = textEl?.textContent ?? chip.querySelector('[data-cal-chip-text]')?.textContent ?? '';
-        let size = fontPx;
-        measureEl.textContent = text;
-        measureEl.style.fontSize = `${size}px`;
-        while (size > 2.5 && measureEl.scrollWidth > textW - 6) {
-          size -= 0.25;
-          measureEl.style.fontSize = `${size}px`;
+      let lo = CAL_PRINT_FONT_MIN;
+      let hi = CAL_PRINT_FONT_MAX;
+      const fitsAt = (f) =>
+        measureCellTextHeight(measureEl, texts, textW, f) + minGap * (n - 1) <= availH;
+      let fontPx;
+      if (fitsAt(hi)) {
+        fontPx = hi;
+      } else if (!fitsAt(lo)) {
+        fontPx = lo;
+      } else {
+        for (let i = 0; i < 9; i++) {
+          const mid = (lo + hi) / 2;
+          if (fitsAt(mid)) lo = mid;
+          else hi = mid;
         }
-        fontPx = Math.min(fontPx, size);
-      });
+        fontPx = Math.max(CAL_PRINT_FONT_MIN, Math.floor(lo * 4) / 4);
+      }
 
-      fontPx = Math.max(2.5, Math.round(fontPx * 4) / 4);
-      const numPx = Math.max(2.5, fontPx - 0.35);
-      const lineH = 1.05;
+      fittedCells.push({ cell, tasksCol, chips, texts, n, minGap, fontPx });
+    });
+
+    // One font size for the whole sheet: the densest cell's size, so sparse
+    // days never print bigger than busy days.
+    const globalFontPx = fittedCells.length
+      ? Math.max(CAL_PRINT_FONT_MIN, Math.min(...fittedCells.map((c) => c.fontPx)))
+      : CAL_PRINT_FONT_MIN;
+
+    // Pass 2: apply the uniform font; per-cell leftover height still becomes
+    // even gaps (capped so sparse cells stay top-aligned instead of scattering
+    // 1–2 names oddly).
+    fittedCells.forEach(({ cell, tasksCol, chips, texts, n, minGap }) => {
+      const fontPx = globalFontPx;
+      const textH = Math.min(availH, measureCellTextHeight(measureEl, texts, textW, fontPx));
+      const leftover = Math.max(0, availH - textH);
+      const gapPx = Math.min(
+        n > 1 ? leftover / (n - 1) : 0,
+        Math.max(minGap, fontPx * 0.9),
+      );
+
+      // Capped so 1–2 digits fit inside the compact print badge
+      const numPx = Math.max(3, Math.min(fontPx - 0.5, 6.5));
+
+      tasksCol.setAttribute('data-task-count', String(n));
+      tasksCol.style.setProperty('height', '100%', 'important');
+      tasksCol.style.setProperty('flex', '1 1 auto', 'important');
+      tasksCol.style.setProperty('gap', `${Math.max(minGap, gapPx)}px`, 'important');
       tasksCol.style.setProperty('--cal-print-font-size', `${fontPx}px`);
       tasksCol.style.setProperty('--cal-print-num-font-size', `${numPx}px`);
-      tasksCol.style.setProperty('--cal-print-line-height', String(lineH));
-      tasksCol.style.setProperty('gap', `${gapPx}px`);
+      tasksCol.style.setProperty('--cal-print-line-height', String(CAL_PRINT_LINE_H));
 
       chips.forEach((chip) => {
         if (!(chip instanceof HTMLElement)) return;
+        chip.style.setProperty('flex', '0 0 auto', 'important');
         chip.style.setProperty('min-height', '0', 'important');
+        chip.style.setProperty('height', 'auto', 'important');
+        chip.style.setProperty('max-height', 'none', 'important');
         chip.style.setProperty('padding', '0', 'important');
+        chip.style.setProperty('align-items', 'flex-start', 'important');
+        chip.style.setProperty('gap', `${CAL_PRINT_CHIP_GAP}px`, 'important');
         const textEl = chip.querySelector('[data-cal-chip-text]');
         const numEl = chip.querySelector('span[aria-hidden]');
         if (textEl instanceof HTMLElement) {
           textEl.style.setProperty('font-size', `${fontPx}px`, 'important');
-          textEl.style.setProperty('line-height', String(lineH), 'important');
+          textEl.style.setProperty('line-height', String(CAL_PRINT_LINE_H), 'important');
+          textEl.style.setProperty('white-space', 'normal', 'important');
+          textEl.style.setProperty('overflow-wrap', 'break-word', 'important');
+          textEl.style.setProperty('text-overflow', 'clip', 'important');
         }
         if (numEl instanceof HTMLElement) {
           numEl.style.setProperty('font-size', `${numPx}px`, 'important');
-          numEl.style.setProperty('line-height', String(lineH), 'important');
-          numEl.style.setProperty('min-height', '0', 'important');
+          numEl.style.setProperty('line-height', String(CAL_PRINT_LINE_H), 'important');
+          numEl.style.setProperty('width', `${CAL_PRINT_BADGE_W}px`, 'important');
+          numEl.style.setProperty('min-width', `${CAL_PRINT_BADGE_W}px`, 'important');
           numEl.style.setProperty('height', 'auto', 'important');
         }
       });
+
+      const dayNum = cell.querySelector('b')?.textContent ?? '?';
+      cellStats.push(`day ${dayNum}: n=${n} font=${fontPx}px gap=${gapPx.toFixed(1)}`);
     });
+
+    console.log(
+      `[${PRINT_FIT_VERSION}] weeks=${paper.weekCount} cell=${paper.cellW.toFixed(0)}×${paper.cellH.toFixed(0)}px textW=${textW.toFixed(0)} globalFont=${globalFontPx}px\n` +
+        cellStats.join('\n'),
+    );
   } finally {
     measureEl.remove();
   }
@@ -335,12 +461,26 @@ function fitElementToOnePage(el, orientation = 'landscape', minScale = 0.35) {
   el.style.width = `${100 / scale}%`;
 }
 
-function fitElementToOneLandscapePage(el, minScale = 0.35) {
-  fitElementToOnePage(el, 'landscape', minScale);
-}
-
 function fitElementToOnePortraitPage(el, minScale = 0.35) {
   fitElementToOnePage(el, 'portrait', minScale);
+}
+
+function refitPrintContent() {
+  const summary = document.querySelector('.summary-print-wrap:not(.summary-print-empty)');
+  if (summary) {
+    // Each two-week block prints on its own A4 page; shrink any block that is
+    // taller than one page so it never spills onto a third page.
+    const pages = summary.querySelectorAll('.summary-print-page');
+    if (pages.length > 0) {
+      pages.forEach((pg) => fitElementToOnePortraitPage(pg));
+    } else {
+      fitElementToOnePortraitPage(summary);
+    }
+    return;
+  }
+  if (document.querySelector('.cal-print-sheet')) {
+    fitCalendarPrintCellFonts('portrait');
+  }
 }
 
 function preparePrintLayout() {
@@ -350,22 +490,26 @@ function preparePrintLayout() {
   const summary = document.querySelector('.summary-print-wrap:not(.summary-print-empty)');
   if (summary) {
     document.body.classList.add('print-summary-view');
-    fitElementToOnePortraitPage(summary);
     return;
   }
 
   if (document.querySelector('.cal-print-sheet')) {
     document.body.classList.add('print-calendar-view');
-    fitCalendarPrintCellFonts();
   }
 }
 
-function runPrintWithLayout() {
+function runPrintWithLayout(onAfterPrint) {
   preparePrintLayout();
   window.requestAnimationFrame(() => {
-    preparePrintLayout();
+    refitPrintContent();
     window.requestAnimationFrame(() => {
       window.print();
+      // window.print() blocks while the dialog is open; always restore the
+      // screen afterwards even if the browser never fires `afterprint`.
+      window.setTimeout(() => {
+        resetPrintScale();
+        if (typeof onAfterPrint === 'function') onAfterPrint();
+      }, 300);
     });
   });
 }
@@ -883,7 +1027,14 @@ function CalWeekRow({
       return;
     }
 
+    // While print layout classes are on <body>, cell sizes reflect the A4 print
+    // sheet, not the screen. Measuring then would poison rowMetrics with huge
+    // values (Chrome fires resize events when the print preview opens/closes).
+    const isPrintLayoutActive = () =>
+      document.body.classList.contains('print-fit-one-page');
+
     const measureRow = () => {
+      if (isPrintLayoutActive()) return;
       const sampleCell = host.querySelector('.cal-day-cell[data-cal-date]');
       if (!(sampleCell instanceof HTMLElement)) return;
 
@@ -943,22 +1094,27 @@ function CalWeekRow({
 
     if (typeof document === 'undefined') return;
 
-    try {
-      measureRow();
-    } catch (err) {
-      console.warn('route-planner: row chip measure failed', err);
-      return;
-    }
-
+    let retryTid = 0;
     const onResize = () => {
+      if (isPrintLayoutActive()) {
+        // A resize fired while the print sheet is up; re-measure once the
+        // screen layout is back instead of recording print-sheet sizes.
+        window.clearTimeout(retryTid);
+        retryTid = window.setTimeout(onResize, 300);
+        return;
+      }
       try {
         measureRow();
       } catch (err) {
         console.warn('route-planner: row chip measure on resize failed', err);
       }
     };
+    onResize();
     window.addEventListener('resize', onResize);
-    return () => window.removeEventListener('resize', onResize);
+    return () => {
+      window.removeEventListener('resize', onResize);
+      window.clearTimeout(retryTid);
+    };
   }, [rowMaxTasks, rowTaskKey, enriched]);
 
   return (
@@ -1469,6 +1625,8 @@ function App() {
   /** 双击日历某日：弹层显示该日已排客户（店名 + Account） */
   const [calendarDayDetailDateStr, setCalendarDayDetailDateStr] = useState(null);
   const [viewMode, setViewMode] = useState('calendar');
+  /** 打印后 +1，强制日历重新挂载，恢复被打印布局覆盖的屏幕样式 */
+  const [printEpoch, setPrintEpoch] = useState(0);
   const [importFileName, setImportFileName] = useState(persistedOnMount.importFileName);
   /** 目前記憶體中的 XLSX workbook；與 IndexedDB 快取併用，重開程式可不重新選檔即可換工作表 */
   const importWorkbookRef = useRef(null);
@@ -2112,18 +2270,25 @@ function App() {
   }, [companyName]);
 
   useEffect(() => {
-    const fitPrintToOnePage = () => preparePrintLayout();
+    const fitPrintToOnePage = () => {
+      preparePrintLayout();
+      refitPrintContent();
+    };
+    const restoreAfterPrint = () => {
+      resetPrintScale();
+      setPrintEpoch((n) => n + 1);
+    };
 
     window.addEventListener('beforeprint', fitPrintToOnePage);
-    window.addEventListener('afterprint', resetPrintScale);
+    window.addEventListener('afterprint', restoreAfterPrint);
     return () => {
       window.removeEventListener('beforeprint', fitPrintToOnePage);
-      window.removeEventListener('afterprint', resetPrintScale);
+      window.removeEventListener('afterprint', restoreAfterPrint);
     };
   }, []);
 
   const handlePrintPdf = useCallback(() => {
-    runPrintWithLayout();
+    runPrintWithLayout(() => setPrintEpoch((n) => n + 1));
   }, []);
 
   const dismissSettingsDialog = useCallback(() => {
@@ -2309,6 +2474,55 @@ function App() {
     const summaryRangeTitle =
       from === 1 && to === daysInMonth ? monthLabel : `${monthLabel}, days ${from}–${to}`;
 
+    // Print pagination: group dates into calendar weeks (Sun–Sat, same as the
+    // calendar grid), two weeks per printed A4 page.
+    const firstDow = new Date(`${year}-${monthIsoPad}-01T00:00:00`).getDay();
+    const pageIdxOf = (dateStr) =>
+      Math.floor(Math.floor((Number(dateStr.slice(-2)) - 1 + firstDow) / 7) / 2);
+    const pageGroups = [];
+    dateKeys.forEach((d) => {
+      const p = pageIdxOf(d);
+      const last = pageGroups[pageGroups.length - 1];
+      if (last && last.pageIdx === p) last.dateKeys.push(d);
+      else pageGroups.push({ pageIdx: p, dateKeys: [d] });
+    });
+
+    const renderVisitTable = (keys) => (
+      <div className="summary-print-table-host" style={{ border: '1px solid #e2e8f0', borderRadius: '8px', overflow: 'hidden', background: 'white' }}>
+        <table className="summary-print-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
+          <thead>
+            <tr style={{ background: '#1e293b', color: 'white', textAlign: 'left', fontSize: '12px' }}>
+              <th style={{ ...cell, fontWeight: 600 }}>Date</th>
+              <th style={{ ...cell, fontWeight: 600 }}>#</th>
+              <th style={{ ...cell, fontWeight: 600 }}>Account</th>
+              <th style={{ ...cell, fontWeight: 600 }}>Customer</th>
+              <th style={{ ...cell, fontWeight: 600 }}>Area</th>
+            </tr>
+          </thead>
+          <tbody>
+            {keys.flatMap((dateStr) =>
+              byDate[dateStr].map((row, idx) => {
+                const d = row.weekday ?? weekdayAbbrevFromIso(dateStr);
+                const dayNum = Number(dateStr.slice(-2));
+                const showingDate = idx === 0;
+                return (
+                  <tr key={`${dateStr}-${row.acc}-${idx}`} style={{ background: 'white' }}>
+                    <td style={{ ...cell, color: '#0f172a', fontWeight: showingDate ? 600 : 400, verticalAlign: 'top', whiteSpace: 'nowrap' }}>
+                      {showingDate ? `${d} ${dayNum}` : ''}
+                    </td>
+                    <td style={{ ...cell, color: '#475569', fontWeight: 600, verticalAlign: 'top' }}>{normalizeVisitRound(row.visitRound)}</td>
+                    <td style={{ ...cell, color: '#334155', verticalAlign: 'top' }}>{row.acc}</td>
+                    <td style={{ ...cell, color: '#1e293b', verticalAlign: 'top' }}>{row.name}</td>
+                    <td style={{ ...cell, color: '#64748b', verticalAlign: 'top' }}>{row.area}</td>
+                  </tr>
+                );
+              }),
+            )}
+          </tbody>
+        </table>
+      </div>
+    );
+
     return (
       <div
         className="summary-print-wrap"
@@ -2323,72 +2537,62 @@ function App() {
           gap: '20px',
         }}
       >
-        <div className="summary-print-page-title">
-          {companyName.trim() ? (
-            <span className="app-company-display">{companyName.trim()}</span>
-          ) : null}
-          <span className="summary-print-page-title-meta">
-            Schedule summary · {summaryRangeTitle}
-            {agent ? ` · ${agent}` : ''}
-          </span>
-        </div>
-        <div className="summary-print-kpi-row" style={{ display: 'flex', gap: '16px', flexWrap: 'wrap' }}>
-          {[
-            { label: 'Total visits', value: totalVisits },
-            { label: 'Customers', value: uniqueCustomers },
-            { label: 'Days with visits', value: daysScheduled },
-          ].map((kpi) => (
+        {pageGroups.map((pg, pi) => {
+          const dayA = Number(pg.dateKeys[0].slice(-2));
+          const dayB = Number(pg.dateKeys[pg.dateKeys.length - 1].slice(-2));
+          return (
             <div
-              key={kpi.label}
-              className="summary-print-kpi"
-              style={{
-                flex: '1 1 120px',
-                minWidth: '100px',
-                background: '#f8fafc',
-                border: '1px solid #e2e8f0',
-                borderRadius: '8px',
-                padding: '14px 16px',
-              }}
+              key={`sum-page-${pg.pageIdx}`}
+              className="summary-print-page"
+              style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}
             >
-              <div className="summary-print-kpi-label" style={{ fontSize: '11px', textTransform: 'uppercase', color: '#64748b', marginBottom: '4px' }}>{kpi.label}</div>
-              <div className="summary-print-kpi-value" style={{ fontSize: '22px', fontWeight: '700', color: '#1e293b' }}>{kpi.value}</div>
-            </div>
-          ))}
-        </div>
-
-        <div className="summary-print-table-host" style={{ border: '1px solid #e2e8f0', borderRadius: '8px', overflow: 'hidden', background: 'white' }}>
-          <table className="summary-print-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
-            <thead>
-              <tr style={{ background: '#1e293b', color: 'white', textAlign: 'left', fontSize: '12px' }}>
-                <th style={{ ...cell, fontWeight: 600 }}>Date</th>
-                <th style={{ ...cell, fontWeight: 600 }}>#</th>
-                <th style={{ ...cell, fontWeight: 600 }}>Account</th>
-                <th style={{ ...cell, fontWeight: 600 }}>Customer</th>
-                <th style={{ ...cell, fontWeight: 600 }}>Area</th>
-              </tr>
-            </thead>
-            <tbody>
-              {dateKeys.flatMap((dateStr) =>
-                byDate[dateStr].map((row, idx) => {
-                  const d = row.weekday ?? weekdayAbbrevFromIso(dateStr);
-                  const dayNum = Number(dateStr.slice(-2));
-                  const showingDate = idx === 0;
-                  return (
-                    <tr key={`${dateStr}-${row.acc}-${idx}`} style={{ background: 'white' }}>
-                      <td style={{ ...cell, color: '#0f172a', fontWeight: showingDate ? 600 : 400, verticalAlign: 'top', whiteSpace: 'nowrap' }}>
-                        {showingDate ? `${d} ${dayNum}` : ''}
-                      </td>
-                      <td style={{ ...cell, color: '#475569', fontWeight: 600, verticalAlign: 'top' }}>{normalizeVisitRound(row.visitRound)}</td>
-                      <td style={{ ...cell, color: '#334155', verticalAlign: 'top' }}>{row.acc}</td>
-                      <td style={{ ...cell, color: '#1e293b', verticalAlign: 'top' }}>{row.name}</td>
-                      <td style={{ ...cell, color: '#64748b', verticalAlign: 'top' }}>{row.area}</td>
-                    </tr>
-                  );
-                }),
+              {pi === 0 ? (
+                <>
+                  <div className="summary-print-page-title">
+                    {companyName.trim() ? (
+                      <span className="app-company-display">{companyName.trim()}</span>
+                    ) : null}
+                    <span className="summary-print-page-title-meta">
+                      Schedule summary · {summaryRangeTitle}
+                      {agent ? ` · ${agent}` : ''}
+                    </span>
+                  </div>
+                  <div className="summary-print-kpi-row" style={{ display: 'flex', gap: '16px', flexWrap: 'wrap' }}>
+                    {[
+                      { label: 'Total visits', value: totalVisits },
+                      { label: 'Customers', value: uniqueCustomers },
+                      { label: 'Days with visits', value: daysScheduled },
+                    ].map((kpi) => (
+                      <div
+                        key={kpi.label}
+                        className="summary-print-kpi"
+                        style={{
+                          flex: '1 1 120px',
+                          minWidth: '100px',
+                          background: '#f8fafc',
+                          border: '1px solid #e2e8f0',
+                          borderRadius: '8px',
+                          padding: '14px 16px',
+                        }}
+                      >
+                        <div className="summary-print-kpi-label" style={{ fontSize: '11px', textTransform: 'uppercase', color: '#64748b', marginBottom: '4px' }}>{kpi.label}</div>
+                        <div className="summary-print-kpi-value" style={{ fontSize: '22px', fontWeight: '700', color: '#1e293b' }}>{kpi.value}</div>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <div className="summary-print-page-title">
+                  <span className="summary-print-page-title-meta">
+                    Schedule summary · {summaryRangeTitle}
+                    {agent ? ` · ${agent}` : ''} · days {dayA}–{dayB}
+                  </span>
+                </div>
               )}
-            </tbody>
-          </table>
-        </div>
+              {renderVisitTable(pg.dateKeys)}
+            </div>
+          );
+        })}
       </div>
     );
   };
@@ -2913,7 +3117,7 @@ function App() {
         >
           {calendarWeeks.map((weekCells, wi) => (
             <CalWeekRow
-              key={`week-${wi}-${year}-${month}`}
+              key={`week-${wi}-${year}-${month}-p${printEpoch}`}
               weekCells={weekCells}
               monthIsoPad={monthIsoPad}
               year={year}
@@ -2950,7 +3154,7 @@ function App() {
           }
           @page cal-sheet {
             margin: 5mm;
-            size: A4 landscape;
+            size: A4 portrait;
           }
           html, body, #root {
             margin: 0 !important;
@@ -2967,6 +3171,44 @@ function App() {
             display: block !important;
             min-height: 0 !important;
             flex: none !important;
+          }
+          /* Summary prints as a flowing multi-page document: undo the
+             one-page clip (that clip exists for the fixed calendar sheet)
+             on the whole ancestor chain so page breaks can happen. */
+          html:has(body.print-summary-view),
+          body.print-summary-view,
+          body.print-summary-view #root {
+            height: auto !important;
+            max-height: none !important;
+            overflow: visible !important;
+          }
+          body.print-summary-view .app-root-shell {
+            display: block !important;
+            height: auto !important;
+            max-height: none !important;
+            min-height: 0 !important;
+            overflow: visible !important;
+          }
+          body.print-summary-view .main-column {
+            display: block !important;
+            height: auto !important;
+            min-height: 0 !important;
+            overflow: visible !important;
+          }
+          body.print-summary-view .main-scroll-region {
+            display: block !important;
+            height: auto !important;
+            min-height: 0 !important;
+            overflow: visible !important;
+            flex: none !important;
+            padding: 0 !important;
+          }
+          body.print-summary-view .content-white-panel {
+            display: block !important;
+            height: auto !important;
+            min-height: 0 !important;
+            overflow: visible !important;
+            border: none !important;
           }
           .cal-print-sheet {
             page: cal-sheet;
@@ -3064,21 +3306,26 @@ function App() {
           .schedule-strip-print {
             display: none !important;
           }
+          /* Summary prints in normal flow: one page per two-week block */
           body.print-summary-view .summary-print-wrap:not(.summary-print-empty) {
-            position: fixed !important;
-            top: 0 !important;
-            left: 0 !important;
-            right: 0 !important;
-            bottom: 0 !important;
+            position: static !important;
+            display: block !important;
             width: 100% !important;
-            height: 100% !important;
-            overflow: hidden !important;
+            height: auto !important;
+            overflow: visible !important;
             box-sizing: border-box !important;
-            page-break-after: avoid !important;
-            page-break-inside: avoid !important;
-            transform-origin: top left;
-            z-index: 99999 !important;
             background: white !important;
+          }
+          body.print-summary-view .summary-print-page {
+            break-after: page;
+            page-break-after: always;
+            break-inside: avoid;
+            page-break-inside: avoid;
+            transform-origin: top left;
+          }
+          body.print-summary-view .summary-print-page:last-child {
+            break-after: auto;
+            page-break-after: auto;
           }
           .cal-week-row {
             width: 100% !important;
@@ -3096,16 +3343,16 @@ function App() {
             box-sizing: border-box !important;
           }
           .cal-day-cell {
-            padding: 0.8mm !important;
+            padding: 0.4mm !important;
             display: flex !important;
             flex-direction: row !important;
-            align-items: flex-start !important;
-            gap: 0.8mm !important;
+            align-items: stretch !important;
+            gap: 0.2mm !important;
           }
           .cal-day-cell > b {
             flex: 0 0 auto !important;
-            width: 5mm !important;
-            min-width: 5mm !important;
+            width: 3mm !important;
+            min-width: 3mm !important;
             font-size: 8pt !important;
             line-height: 1.1 !important;
             text-align: left !important;
@@ -3115,8 +3362,9 @@ function App() {
             flex: 1 1 auto !important;
             min-width: 0 !important;
             min-height: 0 !important;
+            height: 100% !important;
             margin-top: 0 !important;
-            gap: 0.15mm !important;
+            gap: var(--cal-print-gap, 0.4px) !important;
             display: flex !important;
             flex-direction: column !important;
             overflow: hidden !important;
@@ -3127,6 +3375,7 @@ function App() {
             width: 100% !important;
             min-height: 0 !important;
             height: auto !important;
+            max-height: none !important;
             padding: 0 !important;
             border-radius: 0 !important;
             gap: 0.3mm !important;
@@ -3149,16 +3398,17 @@ function App() {
           .cal-day-tasks [data-cal-chip-text] {
             flex: 1 1 auto !important;
             min-width: 0 !important;
-            font-size: var(--cal-print-font-size, 5pt) !important;
-            line-height: var(--cal-print-line-height, 1.05) !important;
+            font-size: var(--cal-print-font-size, 7pt) !important;
+            line-height: var(--cal-print-line-height, 1.08) !important;
             color: var(--visit-round-color, #1e293b) !important;
             font-weight: 700 !important;
-            white-space: nowrap !important;
+            white-space: normal !important;
+            overflow-wrap: break-word !important;
             overflow: hidden !important;
-            text-overflow: ellipsis !important;
+            text-overflow: clip !important;
           }
           .cal-day-tasks span[aria-hidden] {
-            font-size: var(--cal-print-num-font-size, 4.5pt) !important;
+            font-size: var(--cal-print-num-font-size, 6.5pt) !important;
             line-height: var(--cal-print-line-height, 1.05) !important;
             color: var(--visit-round-color, #1e293b) !important;
           }
@@ -3231,6 +3481,108 @@ function App() {
             break-inside: avoid;
             page-break-inside: avoid;
           }
+        }
+        /* Apply print calendar layout before the dialog so auto-fit measures real cell size */
+        body.print-calendar-view .no-print {
+          display: none !important;
+        }
+        body.print-calendar-view .cal-print-sheet {
+          position: fixed !important;
+          top: 0 !important;
+          left: 0 !important;
+          right: 0 !important;
+          bottom: 0 !important;
+          width: 100% !important;
+          height: 100% !important;
+          display: flex !important;
+          flex-direction: column !important;
+          box-sizing: border-box !important;
+          overflow: hidden !important;
+          background: white !important;
+          z-index: 99999 !important;
+        }
+        body.print-calendar-view .cal-print-sheet .cal-calendar-body {
+          flex: 1 1 auto !important;
+          min-height: 0 !important;
+          height: 100% !important;
+          display: flex !important;
+          flex-direction: column !important;
+        }
+        body.print-calendar-view .cal-print-sheet .cal-weeks-stack {
+          flex: 1 1 auto !important;
+          min-height: 0 !important;
+          display: grid !important;
+          grid-template-rows: repeat(var(--cal-week-rows, 6), minmax(0, 1fr)) !important;
+        }
+        body.print-calendar-view .cal-week-block {
+          height: 100% !important;
+          min-height: 0 !important;
+        }
+        body.print-calendar-view .cal-week-row {
+          display: grid !important;
+          grid-template-columns: repeat(7, minmax(0, 1fr)) !important;
+          height: 100% !important;
+          align-items: stretch !important;
+        }
+        body.print-calendar-view .cal-day-cell,
+        body.print-calendar-view .cal-pad-cell {
+          height: 100% !important;
+          min-height: 0 !important;
+          overflow: hidden !important;
+          box-sizing: border-box !important;
+          padding: 0.4mm !important;
+          display: flex !important;
+          flex-direction: row !important;
+          align-items: stretch !important;
+          gap: 0.2mm !important;
+        }
+        body.print-calendar-view .cal-day-cell > b {
+          flex: 0 0 auto !important;
+          width: 3mm !important;
+          min-width: 3mm !important;
+          font-size: 8pt !important;
+          line-height: 1.1 !important;
+        }
+        body.print-calendar-view .cal-day-tasks {
+          flex: 1 1 auto !important;
+          min-width: 0 !important;
+          min-height: 0 !important;
+          height: 100% !important;
+          margin-top: 0 !important;
+          display: flex !important;
+          flex-direction: column !important;
+          overflow: hidden !important;
+        }
+        body.print-calendar-view .cal-day-task-chip {
+          flex: 0 0 auto !important;
+          width: 100% !important;
+          min-height: 0 !important;
+          height: auto !important;
+          max-height: none !important;
+          background: transparent !important;
+          border: none !important;
+          border-radius: 0 !important;
+          padding: 0 !important;
+          box-shadow: none !important;
+        }
+        body.print-calendar-view .cal-day-tasks [data-cal-chip-text] {
+          flex: 1 1 auto !important;
+          min-width: 0 !important;
+          font-size: var(--cal-print-font-size, 7pt) !important;
+          line-height: var(--cal-print-line-height, 1.08) !important;
+          color: var(--visit-round-color, #1e293b) !important;
+          font-weight: 700 !important;
+          white-space: normal !important;
+          overflow-wrap: break-word !important;
+          overflow: hidden !important;
+          text-overflow: clip !important;
+        }
+        body.print-calendar-view .cal-day-tasks span[aria-hidden] {
+          font-size: var(--cal-print-num-font-size, 6.5pt) !important;
+          line-height: var(--cal-print-line-height, 1.08) !important;
+          color: var(--visit-round-color, #1e293b) !important;
+          background: transparent !important;
+          font-weight: 800 !important;
         }
         .cal-calendar-print-header {
           display: none;
@@ -4143,7 +4495,7 @@ function App() {
           <button
             type="button"
             onClick={handlePrintPdf}
-            title="Print or save as PDF: Calendar fits one landscape page; Summary fits one portrait page."
+            title="Print or save as PDF: Calendar and Summary fit one portrait A4 page each."
             style={{ background: '#2563eb', color: 'white', border: 'none', padding: '10px 25px', borderRadius: '8px', cursor: 'pointer', fontWeight:'bold' }}
           >
             PRINT / PDF
