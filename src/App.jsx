@@ -178,24 +178,58 @@ function moveCalendarVisitsToDate(agentSched, payloads, placementDate) {
   return changed;
 }
 
-/** After add / remove / move: #1, #2, #3 follow remaining dates so colours match the live count. */
+/** After add / remove / move: #1, #2, #3 restart each calendar month so a new month’s first day is blue. */
 function resequenceVisitRoundsForAcc(agentSched, acc) {
   if (!agentSched || acc == null || String(acc) === '') return;
   const accStr = String(acc);
-  const hits = [];
+  const byMonth = new Map();
   for (const [dateStr, list] of Object.entries(agentSched)) {
-    if (!Array.isArray(list)) continue;
+    if (!Array.isArray(list) || dateStr.length < 7) continue;
     list.forEach((t, index) => {
-      if (t && String(t.acc) === accStr) hits.push({ dateStr, index });
+      if (!t || String(t.acc) !== accStr) return;
+      const ym = dateStr.slice(0, 7);
+      let hits = byMonth.get(ym);
+      if (!hits) {
+        hits = [];
+        byMonth.set(ym, hits);
+      }
+      hits.push({ dateStr, index });
     });
   }
-  hits.sort((a, b) => String(a.dateStr).localeCompare(String(b.dateStr)));
-  hits.forEach((h, n) => {
-    const cur = agentSched[h.dateStr][h.index];
-    const nextRound = n + 1;
-    if (normalizeVisitRound(cur.visitRound ?? 1) === nextRound) return;
-    agentSched[h.dateStr][h.index] = { ...cur, visitRound: nextRound };
-  });
+  for (const hits of byMonth.values()) {
+    hits.sort((a, b) => String(a.dateStr).localeCompare(String(b.dateStr)));
+    hits.forEach((h, n) => {
+      const cur = agentSched[h.dateStr][h.index];
+      const nextRound = n + 1;
+      if (normalizeVisitRound(cur.visitRound ?? 1) === nextRound) return;
+      agentSched[h.dateStr][h.index] = { ...cur, visitRound: nextRound };
+    });
+  }
+}
+
+/** nth visit of this account inside one month (1 = first day that month = blue). */
+function visitRoundByDateAccForMonth(agentSched, monthPrefix) {
+  const map = new Map();
+  if (!agentSched || typeof agentSched !== 'object' || !monthPrefix) return map;
+  const datesByAcc = new Map();
+  for (const [dateStr, list] of Object.entries(agentSched)) {
+    if (typeof dateStr !== 'string' || !dateStr.startsWith(monthPrefix) || !Array.isArray(list)) continue;
+    for (const t of list) {
+      if (!t || t.acc == null || String(t.acc) === '') continue;
+      const acc = String(t.acc);
+      let dates = datesByAcc.get(acc);
+      if (!dates) {
+        dates = [];
+        datesByAcc.set(acc, dates);
+      }
+      dates.push(dateStr);
+    }
+  }
+  for (const [acc, dates] of datesByAcc) {
+    const sorted = [...new Set(dates)].sort();
+    sorted.forEach((d, i) => map.set(calendarVisitSelectKey(d, acc), i + 1));
+  }
+  return map;
 }
 
 function resequenceVisitRoundsForAccs(agentSched, accs) {
@@ -1087,10 +1121,14 @@ function CalWeekRow({
   calendarFilterAcc,
   calendarChipRoundFilter,
   onDayDoubleClick,
+  onDayClick,
   selectedVisitKeys,
   onToggleVisitSelected,
   onToggleDaySelected,
   onChipDragStart,
+  armedDeleteDate,
+  onArmDeleteDay,
+  monthVisitRounds,
 }) {
   const rowHostRef = useRef(null);
   const [rowMetrics, setRowMetrics] = useState(null);
@@ -1101,10 +1139,14 @@ function CalWeekRow({
         if (slot.kind !== 'day') return slot;
         const dateStr = `${year}-${monthIsoPad}-${String(slot.dayNum).padStart(2, '0')}`;
         const rawTasks = (agent && schedules[agent] && schedules[agent][dateStr]) || [];
+        const withMonthRound = rawTasks.map((t) => {
+          const round = monthVisitRounds?.get(calendarVisitSelectKey(dateStr, t.acc));
+          return round ? { ...t, visitRound: round } : t;
+        });
         const filteredByCust =
           typeof calendarFilterAcc === 'function'
-            ? rawTasks.filter((t) => calendarFilterAcc(t.acc))
-            : rawTasks;
+            ? withMonthRound.filter((t) => calendarFilterAcc(t.acc))
+            : withMonthRound;
         const tasks = filterCalendarTasksByChipRound(filteredByCust, calendarChipRoundFilter);
         return {
           ...slot,
@@ -1113,7 +1155,7 @@ function CalWeekRow({
           tasks,
         };
       }),
-    [weekCells, monthIsoPad, year, agent, schedules, calendarFilterAcc, calendarChipRoundFilter],
+    [weekCells, monthIsoPad, year, agent, schedules, calendarFilterAcc, calendarChipRoundFilter, monthVisitRounds],
   );
 
   const rowMaxTasks = useMemo(
@@ -1266,6 +1308,16 @@ function CalWeekRow({
           }
           const { dayNum, dateStr, isSun, tasks } = cell;
           const isFocused = highlightedDayNum != null && highlightedDayNum === dayNum;
+          const rawDayVisits = (agent && schedules?.[agent]?.[dateStr]) || [];
+          const copyDayItems = [];
+          const copySeen = new Set();
+          for (const t of rawDayVisits) {
+            if (!t || t.acc == null || String(t.acc) === '') continue;
+            const acc = String(t.acc);
+            if (copySeen.has(acc)) continue;
+            copySeen.add(acc);
+            copyDayItems.push({ acc: t.acc, name: t.name });
+          }
           const holidayName = sabahHolidayNameForCalendarDate(dateStr);
           const cellTitle =
             holidayName != null
@@ -1284,6 +1336,11 @@ function CalWeekRow({
                 e.preventDefault();
                 const raw = e.dataTransfer.getData('text') || e.dataTransfer.getData('text/plain');
                 dropOnDate(dateStr, raw);
+              }}
+              onClick={(e) => {
+                const el = e.target;
+                if (el instanceof Element && el.closest('button, input, .cal-day-task-chip')) return;
+                onDayClick?.(dateStr, dayNum);
               }}
               onDoubleClick={() => onDayDoubleClick?.(dateStr)}
               title={cellTitle}
@@ -1313,7 +1370,45 @@ function CalWeekRow({
                   minWidth: 0,
                 }}
               >
-                <b style={{ color: isSun ? '#e11d48' : '#1e293b', fontSize: '15px', fontWeight: 800 }}>{dayNum}</b>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '3px', minWidth: 0 }}>
+                  <b style={{ color: isSun ? '#e11d48' : '#1e293b', fontSize: '15px', fontWeight: 800, cursor: 'pointer' }}>{dayNum}</b>
+                  {copyDayItems.length > 0 ? (
+                    <div
+                      className="no-print"
+                      draggable
+                      title={
+                        armedDeleteDate === dateStr
+                          ? `Selected. Press Delete to remove all ${copyDayItems.length} shops on day ${dayNum}. Drag to copy them.`
+                          : `Click, then press Delete to remove all shops on day ${dayNum}. Drag to copy them onto another day.`
+                      }
+                      aria-label={`Select day ${dayNum} to delete or copy its shops`}
+                      aria-pressed={armedDeleteDate === dateStr}
+                      onMouseDown={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onArmDeleteDay?.(dateStr);
+                      }}
+                      onDoubleClick={(e) => e.stopPropagation()}
+                      onDragStart={(e) => {
+                        e.stopPropagation();
+                        const s = JSON.stringify({ __batch: true, items: copyDayItems });
+                        e.dataTransfer.setData('text', s);
+                        e.dataTransfer.setData('text/plain', s);
+                        e.dataTransfer.effectAllowed = 'copy';
+                      }}
+                      style={{
+                        width: '12px',
+                        height: '12px',
+                        flexShrink: 0,
+                        boxSizing: 'border-box',
+                        border: armedDeleteDate === dateStr ? '1px solid #b91c1c' : '1px solid #0284c7',
+                        borderRadius: '2px',
+                        background: armedDeleteDate === dateStr ? '#fecaca' : '#e0f2fe',
+                        cursor: 'grab',
+                      }}
+                    />
+                  ) : null}
+                </div>
                 {tasks.length > 0 ? (
                   <input
                     type="checkbox"
@@ -1801,6 +1896,8 @@ function App() {
   const [sidebarSelectedRowKeys, setSidebarSelectedRowKeys] = useState(() => new Set());
   /** 日历已排拜访多选（跨日期）：`${dateStr}\\t${acc}` */
   const [calendarSelectedVisitKeys, setCalendarSelectedVisitKeys] = useState(() => new Set());
+  /** 点过日期旁小格、等待 Delete 删整天 */
+  const [calendarDayArmedForDelete, setCalendarDayArmedForDelete] = useState(null);
   /** 勾选时日历与侧栏 Area / Channel / Category 保持一致；未勾选则两套筛选独立（Find / Visits 仍各自独立） */
   const [syncSidebarCalendarFilters, setSyncSidebarCalendarFilters] = useState(false);
   /** Summary / print: day-of-month range within the selected Year–Month */
@@ -2221,10 +2318,12 @@ function App() {
     setUnassignedBrowseModalOpen(false);
     setCalendarDayDetailDateStr(null);
     setCalendarSelectedVisitKeys(new Set());
+    setCalendarDayArmedForDelete(null);
   }, [agent]);
 
   useEffect(() => {
     setCalendarSelectedVisitKeys(new Set());
+    setCalendarDayArmedForDelete(null);
   }, [year, month]);
 
   /** Unassigned sidebar entries have no calendar visits → month-only list is meaningless */
@@ -2298,6 +2397,10 @@ function App() {
     return Math.min(monthVisits, 6);
   };
   const monthIsoPad = String(month + 1).padStart(2, '0');
+  const monthVisitRounds = useMemo(
+    () => visitRoundByDateAccForMonth(agent && schedules[agent], `${year}-${monthIsoPad}-`),
+    [agent, schedules, year, monthIsoPad],
+  );
   const monthLabel = `${year}-${MONTH_SHORT[month]}`;
   const daysInMonth = new Date(year, month + 1, 0).getDate();
   const highlightedDay =
@@ -2318,7 +2421,12 @@ function App() {
     if (calendarDayDetailDateStr == null || !agent) return [];
     const raw = schedules[agent]?.[calendarDayDetailDateStr];
     if (!Array.isArray(raw)) return [];
-    return [...raw].sort((a, b) => {
+    return [...raw]
+      .map((t) => {
+        const round = monthVisitRounds.get(calendarVisitSelectKey(calendarDayDetailDateStr, t.acc));
+        return round ? { ...t, visitRound: round } : t;
+      })
+      .sort((a, b) => {
       const ra = normalizeVisitRound(a.visitRound ?? 1);
       const rb = normalizeVisitRound(b.visitRound ?? 1);
       if (ra !== rb) return ra - rb;
@@ -2327,7 +2435,7 @@ function App() {
         numeric: true,
       });
     });
-  }, [calendarDayDetailDateStr, agent, schedules]);
+  }, [calendarDayDetailDateStr, agent, schedules, monthVisitRounds]);
 
   const calendarWeeks = useMemo(() => {
     const fd = new Date(year, month, 1).getDay();
@@ -2557,7 +2665,9 @@ function App() {
               acc: v.acc,
               name: v.name,
               area: customerByAcc[v.acc]?.area ?? '—',
-              visitRound: normalizeVisitRound(v.visitRound ?? 1),
+              visitRound:
+                monthVisitRounds.get(calendarVisitSelectKey(dateStr, v.acc)) ??
+                normalizeVisitRound(v.visitRound ?? 1),
             })),
           )
           .sort((a, b) => (a.dateStr === b.dateStr ? a.acc.localeCompare(b.acc) : a.dateStr.localeCompare(b.dateStr)));
@@ -2578,7 +2688,7 @@ function App() {
       uniqueCustomers: uniqueAcc.size,
       daysScheduled: dateKeys.length,
     };
-  }, [agent, schedules, year, monthIsoPad, customerByAcc]);
+  }, [agent, schedules, year, monthIsoPad, customerByAcc, monthVisitRounds]);
 
   const summaryFiltered = useMemo(() => {
     if (!summarySections) return null;
@@ -3125,6 +3235,58 @@ function App() {
     });
   };
 
+  const deleteAllVisitsOnArmedDay = () => {
+    const dateStr = calendarDayArmedForDelete;
+    if (!agent || !dateStr) return;
+    const dayList = schedules[agent]?.[dateStr];
+    if (!Array.isArray(dayList) || dayList.length === 0) {
+      setCalendarDayArmedForDelete(null);
+      return;
+    }
+    const dayNum = Number(dateStr.slice(8, 10));
+    const ok = window.confirm(`Delete all ${dayList.length} shops on day ${dayNum}?`);
+    if (!ok) return;
+    const accs = dayList.map((t) => t.acc);
+    setCalendarSelectedVisitKeys((prev) => {
+      let changed = false;
+      const next = new Set(prev);
+      for (const acc of accs) {
+        const k = calendarVisitSelectKey(dateStr, acc);
+        if (next.delete(k)) changed = true;
+      }
+      return changed ? next : prev;
+    });
+    setSchedules((prev) => {
+      const prevAgent = prev[agent];
+      if (!prevAgent?.[dateStr]) return prev;
+      const agentSched = {};
+      for (const k of Object.keys(prevAgent)) agentSched[k] = [...prevAgent[k]];
+      delete agentSched[dateStr];
+      resequenceVisitRoundsForAccs(agentSched, accs);
+      return { ...prev, [agent]: agentSched };
+    });
+    setCalendarDayArmedForDelete(null);
+  };
+
+  useEffect(() => {
+    if (viewMode !== 'calendar') return;
+    const onKey = (e) => {
+      if (calendarDayDetailDateStr != null || settingsDialogOpen || clearImportDialogOpen) return;
+      const tag = e.target instanceof Element ? e.target.tagName : '';
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (e.key === 'Escape') {
+        setCalendarDayArmedForDelete(null);
+        return;
+      }
+      if (e.key !== 'Delete' && e.key !== 'Backspace') return;
+      if (!calendarDayArmedForDelete) return;
+      e.preventDefault();
+      deleteAllVisitsOnArmedDay();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  });
+
   const onCalendarChipDragStart = (e, dateStr, task) => {
     const key = calendarVisitSelectKey(dateStr, task.acc);
     const useBatch = calendarSelectedVisitKeys.has(key) && calendarSelectedVisitKeys.size >= 2;
@@ -3310,6 +3472,7 @@ function App() {
                 if (!agent) return;
                 setCalendarDayDetailDateStr(dateStr);
               }}
+              onDayClick={(_dateStr, dayNum) => setFocusedDay(dayNum)}
               selectedVisitKeys={calendarSelectedVisitKeys}
               onToggleVisitSelected={(dateStr, acc, checked) => {
                 setCalendarSelectedVisitKeys((prev) => {
@@ -3332,6 +3495,11 @@ function App() {
                 });
               }}
               onChipDragStart={onCalendarChipDragStart}
+              monthVisitRounds={monthVisitRounds}
+              armedDeleteDate={calendarDayArmedForDelete}
+              onArmDeleteDay={(dateStr) =>
+                setCalendarDayArmedForDelete((cur) => (cur === dateStr ? null : dateStr))
+              }
             />
           ))}
         </div>
@@ -5042,48 +5210,9 @@ function App() {
                       />
                     </label>
                   </div>
-                  {calendarSelectedVisitKeys.size > 0 ? (
-                    <div
-                      style={{
-                        marginTop: '8px',
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: '8px',
-                        flexWrap: 'wrap',
-                        padding: '6px 8px',
-                        borderRadius: '8px',
-                        background: 'rgba(14, 165, 233, 0.1)',
-                        border: '1px solid rgba(14, 165, 233, 0.35)',
-                      }}
-                    >
-                      <span style={{ fontSize: '12px', fontWeight: 700, color: '#0c4a6e' }}>
-                        {calendarSelectedVisitKeys.size} shop{calendarSelectedVisitKeys.size === 1 ? '' : 's'} selected
-                        {' · '}
-                        tick shops (or the day checkbox), then drag any ticked shop onto the 28th (or any day)
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => setCalendarSelectedVisitKeys(new Set())}
-                        style={{
-                          marginLeft: 'auto',
-                          fontSize: '11px',
-                          fontWeight: 700,
-                          padding: '3px 10px',
-                          borderRadius: '6px',
-                          border: '1px solid #0284c7',
-                          background: '#fff',
-                          color: '#0369a1',
-                          cursor: 'pointer',
-                        }}
-                      >
-                        Clear selection
-                      </button>
-                    </div>
-                  ) : (
-                    <div style={{ marginTop: '6px', fontSize: '11px', color: '#64748b', lineHeight: 1.4 }}>
-                      Tick shops across days, then drag one ticked shop onto another date to move them all.
-                    </div>
-                  )}
+                  <div style={{ marginTop: '6px', fontSize: '12px', fontWeight: 650, color: '#0c4a6e', lineHeight: 1.4 }}>
+                    Click the small box beside a date, then press Delete to remove every shop that day. Drag the same box to copy them onto another day.
+                  </div>
                 </div>
                 {renderCalendar()}
               </>
