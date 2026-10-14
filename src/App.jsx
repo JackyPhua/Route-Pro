@@ -136,6 +136,78 @@ const CAL_CHIP_FONT_MAX = 12;
 const CAL_CHIP_BADGE_W = 20;
 const CAL_CHIP_BTN_SIZE = 22;
 
+/** One scheduled visit on one date (same ACC can appear on other days). */
+function calendarVisitSelectKey(dateStr, acc) {
+  return `${dateStr}\t${String(acc)}`;
+}
+
+/**
+ * Move already-scheduled visits onto placementDate.
+ * Same ACC already on the target day is skipped (stays on the old date).
+ */
+function moveCalendarVisitsToDate(agentSched, payloads, placementDate) {
+  let changed = false;
+  const touchedAccs = new Set();
+  const seenAccOnTarget = new Set(
+    (agentSched[placementDate] || []).map((t) => String(t.acc)),
+  );
+
+  for (const data of payloads) {
+    const oldDate = data?.oldDate;
+    if (!oldDate || data.acc == null || String(data.acc) === '') continue;
+    const acc = String(data.acc);
+    if (oldDate === placementDate) continue;
+    if (seenAccOnTarget.has(acc)) continue;
+
+    const oldList = [...(agentSched[oldDate] || [])];
+    const idx = oldList.findIndex((t) => String(t.acc) === acc);
+    if (idx < 0) continue;
+    const [moved] = oldList.splice(idx, 1);
+    if (oldList.length > 0) agentSched[oldDate] = oldList;
+    else delete agentSched[oldDate];
+
+    const visitRound = normalizeVisitRound(moved.visitRound ?? data.visitRound ?? 1);
+    const daySched = [...(agentSched[placementDate] || [])];
+    daySched.push({ acc: moved.acc, name: moved.name, visitRound });
+    agentSched[placementDate] = daySched;
+    seenAccOnTarget.add(acc);
+    changed = true;
+    touchedAccs.add(acc);
+  }
+  for (const acc of touchedAccs) resequenceVisitRoundsForAcc(agentSched, acc);
+  return changed;
+}
+
+/** After add / remove / move: #1, #2, #3 follow remaining dates so colours match the live count. */
+function resequenceVisitRoundsForAcc(agentSched, acc) {
+  if (!agentSched || acc == null || String(acc) === '') return;
+  const accStr = String(acc);
+  const hits = [];
+  for (const [dateStr, list] of Object.entries(agentSched)) {
+    if (!Array.isArray(list)) continue;
+    list.forEach((t, index) => {
+      if (t && String(t.acc) === accStr) hits.push({ dateStr, index });
+    });
+  }
+  hits.sort((a, b) => String(a.dateStr).localeCompare(String(b.dateStr)));
+  hits.forEach((h, n) => {
+    const cur = agentSched[h.dateStr][h.index];
+    const nextRound = n + 1;
+    if (normalizeVisitRound(cur.visitRound ?? 1) === nextRound) return;
+    agentSched[h.dateStr][h.index] = { ...cur, visitRound: nextRound };
+  });
+}
+
+function resequenceVisitRoundsForAccs(agentSched, accs) {
+  const seen = new Set();
+  for (const acc of accs) {
+    const k = String(acc ?? '');
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    resequenceVisitRoundsForAcc(agentSched, k);
+  }
+}
+
 /** Estimate chip layout before row measure runs (avoids flash on first paint). */
 function estimateRowChipMetrics(maxTaskCount) {
   if (maxTaskCount <= 0) {
@@ -655,6 +727,7 @@ function moveSundayVisitsToMondayForAgentMonth(prevSchedules, agentKey, yearVal,
   let skippedDup = 0;
   let sundayDatesTouched = 0;
   let mutated = false;
+  const touchedAccs = new Set();
 
   for (const sunKey of sundayKeys) {
     const visits = agentSched[sunKey];
@@ -672,6 +745,7 @@ function moveSundayVisitsToMondayForAgentMonth(prevSchedules, agentKey, yearVal,
     for (const v of visits) {
       if (!v || v.acc == null || String(v.acc).length === 0) continue;
       const acc = String(v.acc);
+      touchedAccs.add(acc);
       if (seen.has(acc)) {
         skippedDup += 1;
         continue;
@@ -700,6 +774,7 @@ function moveSundayVisitsToMondayForAgentMonth(prevSchedules, agentKey, yearVal,
     };
   }
 
+  resequenceVisitRoundsForAccs(agentSched, touchedAccs);
   const nextSchedules = normalizePersistedSchedules({ ...prevSchedules, [agentKey]: agentSched });
   return {
     next: nextSchedules,
@@ -747,6 +822,7 @@ function duplicateAgentMonthVisitsOneMonthAhead(prevSchedules, agentKey, yearVal
   let changed = false;
   let sourceDatesShiftedFromBlockedDays = 0;
   let daysSpilledPastTargetMonth = 0;
+  const touchedAccs = new Set();
 
   for (const [dateStr, visits] of Object.entries(byDate)) {
     if (typeof dateStr !== 'string' || !dateStr.startsWith(srcPrefix)) continue;
@@ -778,6 +854,7 @@ function duplicateAgentMonthVisitsOneMonthAhead(prevSchedules, agentKey, yearVal
       seen.add(acc);
       added += 1;
       changed = true;
+      touchedAccs.add(acc);
     }
     agentSched[targetStr] = tgtList;
   }
@@ -792,6 +869,7 @@ function duplicateAgentMonthVisitsOneMonthAhead(prevSchedules, agentKey, yearVal
       daysSpilledPastTargetMonth: 0,
     };
   }
+  resequenceVisitRoundsForAccs(agentSched, touchedAccs);
   const nextSchedules = normalizePersistedSchedules({ ...prevSchedules, [agentKey]: agentSched });
   return {
     next: nextSchedules,
@@ -809,7 +887,15 @@ function colorBucketFromRound(round) {
 }
 
 /** 单日格拜访条列表；整行 slot 等高、左右贴齐，顾客少时下方留白 */
-function CalDayTasksColumn({ dateStr, tasks, removeScheduledVisit, metrics }) {
+function CalDayTasksColumn({
+  dateStr,
+  tasks,
+  removeScheduledVisit,
+  metrics,
+  selectedVisitKeys,
+  onToggleVisitSelected,
+  onChipDragStart,
+}) {
   const { fontPx, gap, padV, numPx, badgeW, btnSize, slotH } =
     metrics ?? estimateRowChipMetrics(tasks.length);
 
@@ -841,15 +927,21 @@ function CalDayTasksColumn({ dateStr, tasks, removeScheduledVisit, metrics }) {
         const chipBg = tp.chipBg;
         const chipFg = tp.chipFg;
         const numLabel = String(r);
+        const selectKey = calendarVisitSelectKey(dateStr, t.acc);
+        const isChipSelected = Boolean(selectedVisitKeys?.has(selectKey));
         return (
           <div
             key={`${dateStr}-${t.acc}-${r}`}
             className="cal-day-task-chip"
             draggable
-            title={`${t.name} · ACC ${t.acc}`}
-            onDragStart={(e) =>
-              e.dataTransfer.setData('text', JSON.stringify({ ...t, oldDate: dateStr }))
-            }
+            title={`${t.name} · ACC ${t.acc}${isChipSelected ? ' · selected' : ''}`}
+            onDragStart={(e) => {
+              if (typeof onChipDragStart === 'function') {
+                onChipDragStart(e, dateStr, t);
+                return;
+              }
+              e.dataTransfer.setData('text', JSON.stringify({ ...t, oldDate: dateStr }));
+            }}
             style={{
               display: 'flex',
               alignItems: 'center',
@@ -867,10 +959,32 @@ function CalDayTasksColumn({ dateStr, tasks, removeScheduledVisit, metrics }) {
               width: '100%',
               alignSelf: 'stretch',
               boxSizing: 'border-box',
-              border: `1px solid rgba(255,255,255,0.22)`,
+              border: isChipSelected ? '2px solid #38bdf8' : '1px solid rgba(255,255,255,0.22)',
+              boxShadow: isChipSelected ? 'inset 0 0 0 1px rgba(14, 165, 233, 0.85)' : undefined,
               ['--visit-round-color']: chipBg,
             }}
           >
+            <input
+              type="checkbox"
+              className="no-print"
+              aria-label={`Select ${t.name} on ${dateStr}`}
+              checked={isChipSelected}
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={(e) => e.stopPropagation()}
+              onDoubleClick={(e) => e.stopPropagation()}
+              onChange={(e) => {
+                e.stopPropagation();
+                onToggleVisitSelected?.(dateStr, t.acc, e.target.checked);
+              }}
+              style={{
+                flexShrink: 0,
+                width: `${Math.max(10, Math.min(13, btnSize - 6))}px`,
+                height: `${Math.max(10, Math.min(13, btnSize - 6))}px`,
+                margin: 0,
+                cursor: 'pointer',
+                accentColor: '#38bdf8',
+              }}
+            />
             <span
               style={{
                 flexShrink: 0,
@@ -973,6 +1087,10 @@ function CalWeekRow({
   calendarFilterAcc,
   calendarChipRoundFilter,
   onDayDoubleClick,
+  selectedVisitKeys,
+  onToggleVisitSelected,
+  onToggleDaySelected,
+  onChipDragStart,
 }) {
   const rowHostRef = useRef(null);
   const [rowMetrics, setRowMetrics] = useState(null);
@@ -1185,12 +1303,50 @@ function CalWeekRow({
                 zIndex: isFocused ? 1 : 0,
               }}
             >
-              <b style={{ flexShrink: 0, color: isSun ? '#e11d48' : '#1e293b', fontSize: '15px', fontWeight: 800 }}>{dayNum}</b>
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: '4px',
+                  flexShrink: 0,
+                  minWidth: 0,
+                }}
+              >
+                <b style={{ color: isSun ? '#e11d48' : '#1e293b', fontSize: '15px', fontWeight: 800 }}>{dayNum}</b>
+                {tasks.length > 0 ? (
+                  <input
+                    type="checkbox"
+                    className="no-print"
+                    aria-label={`Select all shops on day ${dayNum}`}
+                    title="Select all shops this day"
+                    checked={tasks.every((t) => selectedVisitKeys?.has(calendarVisitSelectKey(dateStr, t.acc)))}
+                    onMouseDown={(e) => e.stopPropagation()}
+                    onClick={(e) => e.stopPropagation()}
+                    onDoubleClick={(e) => e.stopPropagation()}
+                    onChange={(e) => {
+                      e.stopPropagation();
+                      onToggleDaySelected?.(dateStr, tasks, e.target.checked);
+                    }}
+                    style={{
+                      width: '12px',
+                      height: '12px',
+                      margin: 0,
+                      cursor: 'pointer',
+                      accentColor: '#2563eb',
+                      flexShrink: 0,
+                    }}
+                  />
+                ) : null}
+              </div>
               <CalDayTasksColumn
                 dateStr={dateStr}
                 tasks={tasks}
                 removeScheduledVisit={removeScheduledVisit}
                 metrics={metricsForRow}
+                selectedVisitKeys={selectedVisitKeys}
+                onToggleVisitSelected={onToggleVisitSelected}
+                onChipDragStart={onChipDragStart}
               />
             </div>
           );
@@ -1643,6 +1799,8 @@ function App() {
   const [calendarNameQuery, setCalendarNameQuery] = useState('');
   /** 侧栏多选：每行单独 key（同 ACC 可并存） */
   const [sidebarSelectedRowKeys, setSidebarSelectedRowKeys] = useState(() => new Set());
+  /** 日历已排拜访多选（跨日期）：`${dateStr}\\t${acc}` */
+  const [calendarSelectedVisitKeys, setCalendarSelectedVisitKeys] = useState(() => new Set());
   /** 勾选时日历与侧栏 Area / Channel / Category 保持一致；未勾选则两套筛选独立（Find / Visits 仍各自独立） */
   const [syncSidebarCalendarFilters, setSyncSidebarCalendarFilters] = useState(false);
   /** Summary / print: day-of-month range within the selected Year–Month */
@@ -2062,7 +2220,12 @@ function App() {
     setSidebarMonthScheduledOnly(false);
     setUnassignedBrowseModalOpen(false);
     setCalendarDayDetailDateStr(null);
+    setCalendarSelectedVisitKeys(new Set());
   }, [agent]);
+
+  useEffect(() => {
+    setCalendarSelectedVisitKeys(new Set());
+  }, [year, month]);
 
   /** Unassigned sidebar entries have no calendar visits → month-only list is meaningless */
   useEffect(() => {
@@ -2900,9 +3063,8 @@ function App() {
       );
     }
 
-    const isCalendarMove = payloads.length === 1 && Boolean(payloads[0].oldDate);
-
-    const isSidebarBatch = payloads.length > 1 && payloads.every((p) => !p.oldDate);
+    const calendarPayloads = payloads.filter((p) => p.oldDate);
+    const sidebarPayloads = payloads.filter((p) => !p.oldDate);
 
     setSchedules((prev) => {
       const prevAgent = prev[agent] || {};
@@ -2917,56 +3079,39 @@ function App() {
         return n;
       };
 
-      if (!isSidebarBatch) {
-        const data = payloads[0];
-
-        const countAcc = () => {
-          let n = 0;
-          for (const arr of Object.values(agentSched)) {
-            for (const t of arr) if (t.acc === data.acc) n += 1;
-          }
-          return n;
-        };
-
-        if (data.oldDate) {
-          const oldList = [...(agentSched[data.oldDate] || [])];
-          const nextOld = oldList.filter((t) => t.acc !== data.acc);
-          if (nextOld.length > 0) agentSched[data.oldDate] = nextOld;
-          else delete agentSched[data.oldDate];
-        }
-
-        const daySched = [...(agentSched[placementDate] || [])];
-        if (daySched.some((c) => c.acc === data.acc)) return prev;
-
-        let visitRound;
-        if (data.oldDate) {
-          visitRound = normalizeVisitRound(data.visitRound ?? 1);
-        } else {
-          visitRound = countAcc() + 1;
-        }
-
-        agentSched[placementDate] = [...daySched, { acc: data.acc, name: data.name, visitRound }];
-        return { ...prev, [agent]: agentSched };
+      let changed = false;
+      const sidebarTouched = [];
+      if (calendarPayloads.length > 0) {
+        changed = moveCalendarVisitsToDate(agentSched, calendarPayloads, placementDate) || changed;
       }
 
-      let changed = false;
-      for (const data of payloads) {
-        if (data.oldDate) continue;
+      for (const data of sidebarPayloads) {
         const daySched = [...(agentSched[placementDate] || [])];
         if (daySched.some((c) => c.acc === data.acc)) continue;
         const visitRound = countAccFor(data.acc) + 1;
         agentSched[placementDate] = [...daySched, { acc: data.acc, name: data.name, visitRound }];
         changed = true;
+        sidebarTouched.push(data.acc);
       }
+      if (sidebarTouched.length > 0) resequenceVisitRoundsForAccs(agentSched, sidebarTouched);
+
       if (!changed) return prev;
       return { ...prev, [agent]: agentSched };
     });
 
-    if (!isCalendarMove) setSidebarSelectedRowKeys(new Set());
+    if (calendarPayloads.length > 0) setCalendarSelectedVisitKeys(new Set());
+    if (sidebarPayloads.length > 0) setSidebarSelectedRowKeys(new Set());
   };
 
   const removeScheduledVisit = (dateStr, acc) => {
     if (!agent) return;
+    setCalendarSelectedVisitKeys((prev) => {
+      const k = calendarVisitSelectKey(dateStr, acc);
+      if (!prev.has(k)) return prev;
+      const next = new Set(prev);
+      next.delete(k);
+      return next;
+    });
     setSchedules((prev) => {
       const prevAgent = prev[agent];
       if (!prevAgent?.[dateStr]) return prev;
@@ -2975,8 +3120,41 @@ function App() {
       const nextDay = agentSched[dateStr].filter((t) => t.acc !== acc);
       if (nextDay.length === 0) delete agentSched[dateStr];
       else agentSched[dateStr] = nextDay;
+      resequenceVisitRoundsForAcc(agentSched, acc);
       return { ...prev, [agent]: agentSched };
     });
+  };
+
+  const onCalendarChipDragStart = (e, dateStr, task) => {
+    const key = calendarVisitSelectKey(dateStr, task.acc);
+    const useBatch = calendarSelectedVisitKeys.has(key) && calendarSelectedVisitKeys.size >= 2;
+    let payload;
+    if (useBatch) {
+      const items = [];
+      const agentSched = schedules[agent] || {};
+      for (const k of calendarSelectedVisitKeys) {
+        const tab = k.indexOf('\t');
+        if (tab < 0) continue;
+        const d = k.slice(0, tab);
+        const acc = k.slice(tab + 1);
+        const found = (agentSched[d] || []).find((x) => String(x.acc) === acc);
+        if (found) {
+          items.push({
+            acc: found.acc,
+            name: found.name,
+            visitRound: found.visitRound,
+            oldDate: d,
+          });
+        }
+      }
+      payload = { __batch: true, items };
+    } else {
+      payload = { ...task, oldDate: dateStr };
+    }
+    const s = JSON.stringify(payload);
+    e.dataTransfer.setData('text', s);
+    e.dataTransfer.setData('text/plain', s);
+    e.dataTransfer.effectAllowed = 'move';
   };
 
   /** Copy this agent's calendar visits in the viewed month onto the next month's same calendar dates (merge; skip dup acc same day). */
@@ -3132,6 +3310,28 @@ function App() {
                 if (!agent) return;
                 setCalendarDayDetailDateStr(dateStr);
               }}
+              selectedVisitKeys={calendarSelectedVisitKeys}
+              onToggleVisitSelected={(dateStr, acc, checked) => {
+                setCalendarSelectedVisitKeys((prev) => {
+                  const next = new Set(prev);
+                  const k = calendarVisitSelectKey(dateStr, acc);
+                  if (checked) next.add(k);
+                  else next.delete(k);
+                  return next;
+                });
+              }}
+              onToggleDaySelected={(dateStr, tasks, checked) => {
+                setCalendarSelectedVisitKeys((prev) => {
+                  const next = new Set(prev);
+                  for (const t of tasks) {
+                    const k = calendarVisitSelectKey(dateStr, t.acc);
+                    if (checked) next.add(k);
+                    else next.delete(k);
+                  }
+                  return next;
+                });
+              }}
+              onChipDragStart={onCalendarChipDragStart}
             />
           ))}
         </div>
@@ -4842,6 +5042,48 @@ function App() {
                       />
                     </label>
                   </div>
+                  {calendarSelectedVisitKeys.size > 0 ? (
+                    <div
+                      style={{
+                        marginTop: '8px',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '8px',
+                        flexWrap: 'wrap',
+                        padding: '6px 8px',
+                        borderRadius: '8px',
+                        background: 'rgba(14, 165, 233, 0.1)',
+                        border: '1px solid rgba(14, 165, 233, 0.35)',
+                      }}
+                    >
+                      <span style={{ fontSize: '12px', fontWeight: 700, color: '#0c4a6e' }}>
+                        {calendarSelectedVisitKeys.size} shop{calendarSelectedVisitKeys.size === 1 ? '' : 's'} selected
+                        {' · '}
+                        tick shops (or the day checkbox), then drag any ticked shop onto the 28th (or any day)
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setCalendarSelectedVisitKeys(new Set())}
+                        style={{
+                          marginLeft: 'auto',
+                          fontSize: '11px',
+                          fontWeight: 700,
+                          padding: '3px 10px',
+                          borderRadius: '6px',
+                          border: '1px solid #0284c7',
+                          background: '#fff',
+                          color: '#0369a1',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        Clear selection
+                      </button>
+                    </div>
+                  ) : (
+                    <div style={{ marginTop: '6px', fontSize: '11px', color: '#64748b', lineHeight: 1.4 }}>
+                      Tick shops across days, then drag one ticked shop onto another date to move them all.
+                    </div>
+                  )}
                 </div>
                 {renderCalendar()}
               </>
